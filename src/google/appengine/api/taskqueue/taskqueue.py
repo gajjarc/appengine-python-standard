@@ -483,6 +483,8 @@ def _MakeAsyncCall(method, request, response, get_result_hook=None, rpc=None):
       A UserRPC object; either the object that was passed in as the RPC
       argument, or a new object if no RPC was passed in.
   """
+  if os.getenv('TASKQUEUE_BACKEND') == 'CLOUD_TASK':
+    raise Exception("TaskQueue calls are disabled when TASKQUEUE_BACKEND is set to CLOUD_TASK")
   if rpc is None:
     rpc = create_rpc()
   assert rpc.service == 'taskqueue', repr(rpc.service)
