@@ -2422,7 +2422,15 @@ class Queue(object):
   def __AddTasks(self, tasks, transactional, fill_request, multiple, rpc=None):
     """Internal implementation of adding tasks where tasks must be a list."""
     if os.getenv('TASKQUEUE_BACKEND') == 'CLOUD_TASK':
-      return self.__AddTasksToCloudTasks(tasks, transactional, multiple)
+      tasks_result = self.__AddTasksToCloudTasks(tasks, transactional, multiple)
+      
+      class CompletedRPC(object):
+        def get_result(self):
+          return tasks_result
+        def check_success(self):
+          pass
+          
+      return CompletedRPC()
 
     def ResultHook(rpc):
       """Processes the TaskQueueBulkAddResponse."""
