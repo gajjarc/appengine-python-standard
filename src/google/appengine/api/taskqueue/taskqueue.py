@@ -2446,11 +2446,76 @@ class Queue(object):
     else:
       return tasks[0]
 
+  def __AddTransactionalTasksToOutbox(self, tasks, multiple):
+    """Helper to add transactional tasks to Datastore outbox."""
+    from google.appengine.api import datastore
+    import json
+    import datetime
+    
+    outbox_keys = []
+    
+    for task in tasks:
+      entity = datastore.Entity('_AE_PendingCloudTask')
+      entity['queue_name'] = self.__name
+      entity['status'] = 'PENDING'
+      entity['created'] = datetime.datetime.utcnow()
+      entity['handled_by_sweeper'] = False
+      entity['retry_count'] = 0
+      
+      task_data = {
+          'url': task.url,
+          'method': task.method,
+          'headers': dict(task.headers) if task.headers else {},
+          'payload': task.payload,
+          'target': task.target,
+      }
+      if task.eta:
+          task_data['eta'] = task.eta.isoformat()
+      if task.retry_options:
+          task_data['retry_options'] = {
+              'task_retry_limit': task.retry_options.task_retry_limit,
+              'min_backoff_seconds': task.retry_options.min_backoff_seconds,
+              'max_backoff_seconds': task.retry_options.max_backoff_seconds,
+          }
+          
+      entity['cloud_task_payload'] = json.dumps(task_data)
+      
+      datastore.Put(entity)
+      outbox_keys.append(entity.key())
+      
+      task._Task__name = "pending-" + str(entity.key().id_or_name())
+      task._Task__queue_name = self.__name
+      task._Task__enqueued = True
+      
+    def _post_commit_hook():
+      try:
+        from google.appengine.api.taskqueue import outbox
+        for key in outbox_keys:
+            outbox.trigger_dispatch(key)
+      except Exception as e:
+        logging.error(f"Error triggering dispatch in post-commit hook: {e}")
+          
+    datastore._add_post_commit_hook(_post_commit_hook)
+    
+    if multiple:
+      return tasks
+    else:
+      return tasks[0]
+
+
   def __AddTasks(self, tasks, transactional, fill_request, multiple, rpc=None):
     """Internal implementation of adding tasks where tasks must be a list."""
     if os.getenv('TASKQUEUE_BACKEND') == 'CLOUD_TASK':
-      tasks_result = self.__AddTasksToCloudTasks(tasks, transactional, multiple)
+      from google.appengine.api import datastore
       
+      if transactional:
+        if not datastore.IsInTransaction():
+          raise BadTransactionStateError('transactional=True but no active transaction')
+          
+        tasks_result = self.__AddTransactionalTasksToOutbox(tasks, multiple)
+      else:
+        tasks_result = self.__AddTasksToCloudTasks(tasks, transactional, multiple)
+        
       class CompletedRPC(object):
         def get_result(self):
           return tasks_result

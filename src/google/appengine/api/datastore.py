@@ -2753,6 +2753,18 @@ def _RunInTransactionInternal(options, mode, function, *args, **kwargs):
 
   raise datastore_errors.TransactionFailedError(
       'The transaction could not be committed. Please try again.')
+_post_commit_hooks = threading.local()
+
+def _get_post_commit_hooks():
+  if not hasattr(_post_commit_hooks, 'hooks'):
+    _post_commit_hooks.hooks = []
+  return _post_commit_hooks.hooks
+
+def _clear_post_commit_hooks():
+  _post_commit_hooks.hooks = []
+
+def _add_post_commit_hook(hook):
+  _get_post_commit_hooks().append(hook)
 
 
 def _DoOneTry(function, args, kwargs):
@@ -2781,8 +2793,16 @@ def _DoOneTry(function, args, kwargs):
       six.reraise(type, value, trace)
   else:
     if _GetConnection().commit():
+      hooks = _get_post_commit_hooks()
+      for hook in hooks:
+        try:
+          hook()
+        except Exception as e:
+          logging.error(f"Error in post-commit hook: {e}")
+      _clear_post_commit_hooks()
       return True, result
     else:
+      _clear_post_commit_hooks()
       return False, None
 
 
