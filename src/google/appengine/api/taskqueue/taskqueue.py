@@ -2386,8 +2386,18 @@ class Queue(object):
         for k, v in task.headers.items():
           app_engine_request.headers[k] = v
           
-      if task.target:
-        app_engine_request.app_engine_routing = tasks_v2beta2.AppEngineRouting(service=task.target)
+      target_service = task.target
+      target_version = None
+      
+      if not target_service:
+        target_service = os.getenv('GAE_SERVICE')
+        target_version = os.getenv('GAE_VERSION')
+        
+      if target_service:
+        routing = tasks_v2beta2.AppEngineRouting(service=target_service)
+        if target_version:
+          routing.version = target_version
+        app_engine_request.app_engine_routing = routing
         
       ct_task = tasks_v2beta2.Task(app_engine_http_request=app_engine_request)
       
