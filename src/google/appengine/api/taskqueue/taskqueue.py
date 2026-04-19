@@ -2390,6 +2390,23 @@ class Queue(object):
       target_version = None
       
       if not target_service:
+        try:
+          with open('queue.yaml', 'r') as f:
+            queue_yaml_content = f.read()
+          from google.appengine.api import queueinfo
+          queue_info = queueinfo.LoadSingleQueue(queue_yaml_content)
+          for entry in queue_info.queue:
+            if entry.name == self.__name:
+              if entry.target:
+                if '.' in entry.target:
+                  target_version, target_service = entry.target.split('.', 1)
+                else:
+                  target_service = entry.target
+                break
+        except Exception as e:
+          logging.warning(f"Failed to read or parse queue.yaml: {e}")
+          
+      if not target_service:
         target_service = os.getenv('GAE_SERVICE')
         target_version = os.getenv('GAE_VERSION')
         
