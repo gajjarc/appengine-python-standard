@@ -467,6 +467,58 @@ def _flatten_params(params):
   return param_list
 
 
+def _DeleteTasksFromCloudTasks(request, response, rpc):
+  """Helper to delete tasks from Cloud Tasks."""
+  from google.appengine.api import app_identity
+  from google.appengine.api import urlfetch
+  import json
+  
+  project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+  location_id = os.getenv('GAE_LOCATION', 'us-east1')
+  queue_name = request.queue_name.decode('utf8')
+  
+  token, _ = app_identity.get_access_token('https://www.googleapis.com/auth/cloud-platform')
+  
+  url = f"https://cloudtasks.googleapis.com/v2beta2/projects/{project_id}/locations/{location_id}/queues/{queue_name}/tasks:batchDelete"
+  
+  headers = {
+      'Authorization': f'Bearer {token}',
+      'Content-Type': 'application/json'
+  }
+  
+  task_names = [t.decode('utf8') for t in request.task_name]
+  resource_names = [f"projects/{project_id}/locations/{location_id}/queues/{queue_name}/tasks/{n}" for n in task_names]
+  
+  payload = {
+      "names": resource_names
+  }
+  
+  logging.info(f"DEBUG: Calling Cloud Tasks batchDelete for {len(task_names)} tasks")
+  
+  result = urlfetch.fetch(
+      url=url,
+      payload=json.dumps(payload),
+      method=urlfetch.POST,
+      headers=headers,
+      validate_certificate=True
+  )
+  
+  if result.status_code != 200:
+      logging.error(f"Cloud Tasks batchDelete failed: {result.status_code} - {result.content}")
+      raise Exception(f"Cloud Tasks batchDelete failed: {result.status_code}")
+      
+  # Populate response
+  for _ in task_names:
+      response.result.append(taskqueue_service_pb2.TaskQueueServiceError.OK)
+      
+  class CompletedRPC(object):
+      def get_result(self):
+          return response
+      def check_success(self):
+          pass
+          
+  return CompletedRPC()
+
 def _MakeAsyncCall(method, request, response, get_result_hook=None, rpc=None):
   """Internal helper to schedule an asynchronous RPC.
 
@@ -484,7 +536,73 @@ def _MakeAsyncCall(method, request, response, get_result_hook=None, rpc=None):
       argument, or a new object if no RPC was passed in.
   """
   if os.getenv('TASKQUEUE_BACKEND') == 'CLOUD_TASK':
-    raise Exception("TaskQueue calls are disabled when TASKQUEUE_BACKEND is set to CLOUD_TASK")
+    if method == 'Delete':
+      return _DeleteTasksFromCloudTasks(request, response, rpc)
+    if method == 'FetchQueueStats':
+      from google.appengine.api import app_identity
+      from google.appengine.api import urlfetch
+      import json
+      
+      project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+      location_id = os.getenv('GAE_LOCATION', 'us-east1')
+      token, _ = app_identity.get_access_token('https://www.googleapis.com/auth/cloud-platform')
+      
+      headers = {
+          'Authorization': f'Bearer {token}',
+          'Content-Type': 'application/json'
+      }
+      
+      for q_name in request.queue_name:
+        q_name_str = q_name.decode('utf8')
+        url = f"https://cloudtasks.googleapis.com/v2beta3/projects/{project_id}/locations/{location_id}/queues/{q_name_str}?readMask=stats"
+        
+        stat = response.queuestat.add()
+        try:
+          result = urlfetch.fetch(url=url, headers=headers, validate_certificate=True)
+          if result.status_code == 200:
+            queue_data = json.loads(result.content)
+            stats = queue_data.get('stats', {})
+            
+            stat.tasks = int(stats.get('tasksCount', 0))
+            stat.in_flight = int(stats.get('concurrentDispatchesCount', 0))
+            stat.executed_last_minute = int(stats.get('executedLastMinuteCount', 0))
+            stat.enforced_rate = float(stats.get('effectiveExecutionRate', 0.0))
+            
+            oldest_eta_str = stats.get('oldestEstimatedArrivalTime')
+            if oldest_eta_str:
+              try:
+                dt = datetime.datetime.fromisoformat(oldest_eta_str.replace('Z', ''))
+                stat.oldest_eta_usec = int(dt.timestamp() * 1000000)
+              except Exception as e:
+                logging.warning(f"Failed to parse oldestEstimatedArrivalTime {oldest_eta_str}: {e}")
+                stat.oldest_eta_usec = -1
+            else:
+              stat.oldest_eta_usec = -1
+          else:
+            logging.error(f"Failed to fetch stats for queue {q_name_str}: {result.status_code}")
+            stat.tasks = 0
+            stat.oldest_eta_usec = -1
+            stat.in_flight = 0
+            stat.executed_last_minute = 0
+            stat.enforced_rate = 0.0
+        except Exception as e:
+          logging.error(f"Error fetching stats for queue {q_name_str}: {e}")
+          stat.tasks = 0
+          stat.oldest_eta_usec = -1
+          stat.in_flight = 0
+          stat.executed_last_minute = 0
+          stat.enforced_rate = 0.0
+          
+      class CompletedRPC(object):
+        def get_result(self):
+          return response
+        def check_success(self):
+          pass
+          
+      return CompletedRPC()
+      
+    raise Exception(f"TaskQueue method {method} is not supported in Cloud Tasks mode yet.")
+    
   if rpc is None:
     rpc = create_rpc()
   assert rpc.service == 'taskqueue', repr(rpc.service)
@@ -1656,6 +1774,15 @@ class Queue(object):
     Raises:
       Error-subclass on application errors.
     """
+    if os.getenv('TASKQUEUE_BACKEND') == 'CLOUD_TASK':
+      from google.cloud import tasks_v2beta2
+      client = tasks_v2beta2.CloudTasksClient()
+      project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+      location_id = os.getenv('GAE_LOCATION', 'us-east1')
+      parent = client.queue_path(project_id, location_id, self.__name)
+      client.purge_queue(name=parent)
+      return
+
     request = taskqueue_service_pb2.TaskQueuePurgeQueueRequest()
     response = taskqueue_service_pb2.TaskQueuePurgeQueueResponse()
 
@@ -1670,6 +1797,21 @@ class Queue(object):
                                      response)
     except apiproxy_errors.ApplicationError as e:
       raise _TranslateError(e.application_error, e.error_detail)
+
+  def list_tasks(self):
+    """Lists tasks in this queue using Cloud Tasks."""
+    if os.getenv('TASKQUEUE_BACKEND') != 'CLOUD_TASK':
+      raise NotImplementedError("list_tasks is only supported in Cloud Tasks mode.")
+      
+    from google.cloud import tasks_v2beta2
+    client = tasks_v2beta2.CloudTasksClient()
+    project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+    location_id = os.getenv('GAE_LOCATION', 'us-east1')
+    parent = client.queue_path(project_id, location_id, self.__name)
+    tasks = client.list_tasks(parent=parent)
+    return [t.name for t in tasks]
+
+
 
   def delete_tasks_by_name_async(self, task_name, rpc=None):
     """Asynchronously deletes a task or list of tasks in this queue, by name.
@@ -2213,8 +2355,74 @@ class Queue(object):
     else:
       return []
 
+  def __AddTasksToCloudTasks(self, tasks, transactional, multiple):
+    """Helper to add tasks to Cloud Tasks."""
+    from google.cloud import tasks_v2beta2
+    from google.protobuf import timestamp_pb2
+    import datetime
+    
+    client = tasks_v2beta2.CloudTasksClient()
+    project_id = os.getenv('GOOGLE_CLOUD_PROJECT')
+    location_id = os.getenv('GAE_LOCATION', 'us-east1')
+    
+    parent = client.queue_path(project_id, location_id, self.__name)
+    
+    for task in tasks:
+      app_engine_request = tasks_v2beta2.AppEngineHttpRequest(
+          relative_url=task.url,
+      )
+      
+      if task.method:
+        method_enum = getattr(tasks_v2beta2.HttpMethod, task.method, tasks_v2beta2.HttpMethod.POST)
+        app_engine_request.http_method = method_enum
+        
+      if task.payload is not None:
+        payload_bytes = task.payload
+        if isinstance(payload_bytes, six.text_type):
+          payload_bytes = payload_bytes.encode('utf8')
+        app_engine_request.payload = payload_bytes
+        
+      if task.headers:
+        for k, v in task.headers.items():
+          app_engine_request.headers[k] = v
+          
+      if task.target:
+        app_engine_request.app_engine_routing = tasks_v2beta2.AppEngineRouting(service=task.target)
+        
+      ct_task = tasks_v2beta2.Task(app_engine_http_request=app_engine_request)
+      
+      if task.eta:
+        ts = timestamp_pb2.Timestamp()
+        ts.FromDatetime(task.eta)
+        ct_task.schedule_time = ts
+        
+      if task.retry_options:
+        try:
+          if task.retry_options.task_retry_limit is not None:
+            ct_task._pb.retry_config.max_attempts = task.retry_options.task_retry_limit
+          if task.retry_options.min_backoff_seconds is not None:
+            ct_task._pb.retry_config.min_backoff.seconds = int(task.retry_options.min_backoff_seconds)
+          if task.retry_options.max_backoff_seconds is not None:
+            ct_task._pb.retry_config.max_backoff.seconds = int(task.retry_options.max_backoff_seconds)
+          logging.info("Successfully set retry_config via ._pb in SDK")
+        except AttributeError as e:
+          logging.warning(f"Failed to set retry_config via ._pb in SDK: {e}. Field might not be compiled in this client version.")
+          
+      response = client.create_task(parent=parent, task=ct_task)
+      
+      task._Task__name = response.name.split('/')[-1]
+      task._Task__queue_name = self.__name
+      task._Task__enqueued = True
+      
+    if multiple:
+      return tasks
+    else:
+      return tasks[0]
+
   def __AddTasks(self, tasks, transactional, fill_request, multiple, rpc=None):
     """Internal implementation of adding tasks where tasks must be a list."""
+    if os.getenv('TASKQUEUE_BACKEND') == 'CLOUD_TASK':
+      return self.__AddTasksToCloudTasks(tasks, transactional, multiple)
 
     def ResultHook(rpc):
       """Processes the TaskQueueBulkAddResponse."""
