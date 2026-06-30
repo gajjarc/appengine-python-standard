@@ -2295,14 +2295,19 @@ class Queue(object):
         'headers': headers,
     }
 
-    # Instead of setting app_engine_routing (which triggers the dot bug),
-    # we set the Host header to force GFE to route to the correct service.
-    if target_service and target_service != 'default':
-      host = f"{target_service}-dot-{default_hostname}"
-      headers['Host'] = host
-      print(f"Jetski: Using AppEngineHttpRequest with Host header override: {host}", flush=True)
+    routing = {}
+    if target_service:
+      routing['service'] = target_service
+      # Also set version to see if it bypasses the regional routing bug
+      version = os.environ.get('GAE_VERSION')
+      if version:
+        routing['version'] = version
+      print(f"Jetski: Using AppEngineHttpRequest with routing: service={target_service}, version={version}", flush=True)
     else:
       print(f"Jetski: Using AppEngineHttpRequest with default routing", flush=True)
+
+    if routing:
+      app_engine_http_request['app_engine_routing'] = routing
 
     ct_task = {
         'app_engine_http_request': app_engine_http_request
