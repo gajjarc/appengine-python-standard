@@ -2242,6 +2242,11 @@ class Queue(object):
     # Construct the target URL using HTTP request to bypass GAE routing bug
     default_hostname = app_identity.get_default_version_hostname()
     target_service = task.target or os.environ.get('GAE_SERVICE')
+    
+    # Workaround for SDK bug that extracts service name with trailing '-dot'
+    if target_service and target_service.endswith('-dot'):
+      target_service = target_service[:-4]
+      
     if target_service and target_service != 'default':
       url_host = f"{target_service}-dot-{default_hostname}"
     else:
