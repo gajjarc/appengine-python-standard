@@ -2253,6 +2253,8 @@ class Queue(object):
       relative_uri = '/' + relative_uri
       
     url = f"https://{url_host}{relative_uri}"
+    import logging
+    logging.info(f"Jetski: Constructed Cloud Tasks URL: {url}")
 
     http_method = tasks_v2beta3.HttpMethod.POST
     if task.method:
