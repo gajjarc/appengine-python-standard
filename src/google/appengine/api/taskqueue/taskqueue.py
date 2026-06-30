@@ -2229,6 +2229,7 @@ class Queue(object):
     from google.cloud import tasks_v2beta3
     from google.protobuf.timestamp_pb2 import Timestamp
     from google.api_core import exceptions as google_exceptions
+    from google.appengine.api import app_identity
 
     client = tasks_v2beta3.CloudTasksClient()
     project = os.environ.get('GOOGLE_CLOUD_PROJECT')
@@ -2238,15 +2239,20 @@ class Queue(object):
 
     parent = client.queue_path(project, region, self.__name)
 
-    routing = {}
+    # Construct the target URL using HTTP request to bypass GAE routing bug
+    default_hostname = app_identity.get_default_version_hostname()
     target_service = task.target or os.environ.get('GAE_SERVICE')
-    if target_service:
-      from google.appengine.api import app_identity
-      default_hostname = app_identity.get_default_version_hostname()
-      if target_service == 'default':
-        routing['host'] = default_hostname
-      else:
-        routing['host'] = f"{target_service}-dot-{default_hostname}"
+    if target_service and target_service != 'default':
+      url_host = f"{target_service}-dot-{default_hostname}"
+    else:
+      url_host = default_hostname
+    
+    # Ensure task.url starts with /
+    relative_uri = task.url or '/'
+    if not relative_uri.startswith('/'):
+      relative_uri = '/' + relative_uri
+      
+    url = f"https://{url_host}{relative_uri}"
 
     http_method = tasks_v2beta3.HttpMethod.POST
     if task.method:
@@ -2263,6 +2269,11 @@ class Queue(object):
     if task.headers:
       headers = dict(task.headers)
 
+    # Manually inject GAE headers for compatibility with the test app
+    headers['X-AppEngine-QueueName'] = self.__name
+    if task.name:
+      headers['X-AppEngine-TaskName'] = task.name
+
     body = b''
     if task.payload:
       if isinstance(task.payload, str):
@@ -2270,17 +2281,15 @@ class Queue(object):
       else:
         body = task.payload
 
-    app_engine_http_request = {
+    http_request = {
         'http_method': http_method,
-        'relative_uri': task.url or '/',
+        'url': url,
         'body': body,
         'headers': headers,
     }
-    if routing:
-      app_engine_http_request['app_engine_routing'] = routing
 
     ct_task = {
-        'app_engine_http_request': app_engine_http_request
+        'http_request': http_request
     }
 
     if task.name:
