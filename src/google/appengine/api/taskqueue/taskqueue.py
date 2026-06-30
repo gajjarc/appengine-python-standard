@@ -2287,15 +2287,25 @@ class Queue(object):
       else:
         body = task.payload
 
-    http_request = {
+    # Construct AppEngineHttpRequest
+    app_engine_http_request = {
         'http_method': http_method,
-        'url': url,
+        'relative_uri': task.url or '/',
         'body': body,
         'headers': headers,
     }
 
+    # Instead of setting app_engine_routing (which triggers the dot bug),
+    # we set the Host header to force GFE to route to the correct service.
+    if target_service and target_service != 'default':
+      host = f"{target_service}-dot-{default_hostname}"
+      headers['Host'] = host
+      print(f"Jetski: Using AppEngineHttpRequest with Host header override: {host}", flush=True)
+    else:
+      print(f"Jetski: Using AppEngineHttpRequest with default routing", flush=True)
+
     ct_task = {
-        'http_request': http_request
+        'app_engine_http_request': app_engine_http_request
     }
 
     if task.name:
