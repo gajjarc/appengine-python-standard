@@ -2241,7 +2241,12 @@ class Queue(object):
     routing = {}
     target_service = task.target or os.environ.get('GAE_SERVICE')
     if target_service:
-      routing['service'] = target_service
+      from google.appengine.api import app_identity
+      default_hostname = app_identity.get_default_version_hostname()
+      if target_service == 'default':
+        routing['host'] = default_hostname
+      else:
+        routing['host'] = f"{target_service}-dot-{default_hostname}"
 
     http_method = tasks_v2beta3.HttpMethod.POST
     if task.method:
