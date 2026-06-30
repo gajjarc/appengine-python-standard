@@ -2239,8 +2239,9 @@ class Queue(object):
     parent = client.queue_path(project, region, self.__name)
 
     routing = {}
-    if task.target:
-      routing['service'] = task.target
+    target_service = task.target or os.environ.get('GAE_SERVICE')
+    if target_service:
+      routing['service'] = target_service
 
     http_method = tasks_v2beta3.HttpMethod.POST
     if task.method:
