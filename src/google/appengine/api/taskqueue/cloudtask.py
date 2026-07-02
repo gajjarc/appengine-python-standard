@@ -156,6 +156,13 @@ def create_task_in_cloud_tasks(queue_name, task, multiple):
   if task.name:
     ct_task['name'] = client.task_path(project, region, queue_name, task.name)
 
+  if task.retry_options:
+    import logging
+    logging.warning(
+        "Jetski: Per-task retry_options are ignored by the CLOUD_TASK backend. "
+        "Please configure retry settings at the queue level instead."
+    )
+
   if task.eta:
     epoch = datetime.datetime.utcfromtimestamp(0)
     eta = task.eta
