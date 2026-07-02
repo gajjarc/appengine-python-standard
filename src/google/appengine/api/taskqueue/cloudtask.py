@@ -227,9 +227,18 @@ def _convert_to_rest_payload(ct_task):
     )
 
   if 'retry_config' in ct_task:
-    rest_task['retry_config'] = json_format.MessageToDict(
-        ct_task['retry_config'], preserving_proto_field_name=True
-    )
+    rc = ct_task['retry_config']
+    rest_rc = {}
+    if 'max_attempts' in rc:
+      rest_rc['max_attempts'] = rc['max_attempts']
+    if 'max_doublings' in rc:
+      rest_rc['max_doublings'] = rc['max_doublings']
+
+    for duration_field in ['max_retry_duration', 'min_backoff', 'max_backoff']:
+      if duration_field in rc and rc[duration_field]:
+        rest_rc[duration_field] = json_format.MessageToDict(rc[duration_field])
+
+    rest_task['retry_config'] = rest_rc
 
   return rest_task
 
