@@ -189,3 +189,80 @@ def create_task_in_cloud_tasks(queue_name, task, multiple):
     raise TaskAlreadyExistsError(str(e))
   except Exception as e:
     raise e
+
+
+def purge_queue_in_cloud_tasks(queue_name):
+  """Purges all tasks in a queue using Cloud Tasks API."""
+  client = tasks_v2beta3.CloudTasksClient()
+  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  if project and (project.startswith('s~') or project.startswith('e~')):
+    project = project[2:]
+  region = _get_region()
+
+  name = client.queue_path(project, region, queue_name)
+  try:
+    client.purge_queue(request={'name': name})
+    print(
+        f"Jetski: Successfully purged queue {queue_name} using Cloud Tasks",
+        flush=True,
+    )
+  except Exception as e:
+    raise e
+
+
+def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
+  """Deletes tasks from a queue using Cloud Tasks API."""
+  client = tasks_v2beta3.CloudTasksClient()
+  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  if project and (project.startswith('s~') or project.startswith('e~')):
+    project = project[2:]
+  region = _get_region()
+
+  # Check pre-conditions (duplicate names or already deleted)
+  task_names = set()
+  for task in tasks:
+    if not task.name:
+      from google.appengine.api.taskqueue.taskqueue import BadTaskStateError
+      raise BadTaskStateError('A task name must be specified for a task')
+    if task.was_deleted:
+      from google.appengine.api.taskqueue.taskqueue import BadTaskStateError
+      raise BadTaskStateError(
+          'The task %s has already been deleted' % task.name
+      )
+    if task.name in task_names:
+      from google.appengine.api.taskqueue.taskqueue import DuplicateTaskNameError
+      raise DuplicateTaskNameError(
+          'The task name %s is duplicated' % task.name
+      )
+    task_names.add(task.name)
+
+  exception = None
+  for task in tasks:
+    name = client.task_path(project, region, queue_name, task.name)
+    try:
+      client.delete_task(request={'name': name})
+      task._Task__deleted = True
+      print(
+          f"Jetski: Successfully deleted task {task.name} using Cloud Tasks",
+          flush=True,
+      )
+    except google_exceptions.NotFound:
+      # Already deleted or completed, corresponding to UNKNOWN_TASK/TOMBSTONED_TASK
+      task._Task__deleted = False
+      print(
+          f"Jetski: Task {task.name} not found (already processed/deleted)"
+          " during deletion",
+          flush=True,
+      )
+    except Exception as e:
+      if exception is None:
+        exception = e
+
+  if exception is not None:
+    raise exception
+
+  if multiple:
+    return tasks
+  else:
+    return tasks[0]
+
