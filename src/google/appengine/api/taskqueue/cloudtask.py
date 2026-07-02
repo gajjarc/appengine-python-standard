@@ -63,17 +63,40 @@ def _get_region():
   return 'us-central1'
 
 
-def create_task_in_cloud_tasks(queue_name, task, multiple):
-  """Calls Cloud Tasks API to create a task."""
-  client = tasks_v2beta3.CloudTasksClient()
-  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
-  if project and (project.startswith('s~') or project.startswith('e~')):
-    project = project[2:]
-  region = _get_region()
+def _to_duration(seconds):
+  if seconds is None:
+    return None
+  from google.protobuf.duration_pb2 import Duration
+  duration = Duration()
+  duration.seconds = int(seconds)
+  duration.nanos = int((seconds - duration.seconds) * 1e9)
+  return duration
 
-  parent = client.queue_path(project, region, queue_name)
 
-  # Construct the target URL using HTTP request to bypass GAE routing bug
+def _build_retry_config(retry_options):
+  if not retry_options:
+    return None
+
+  config = {}
+
+  if retry_options.task_retry_limit is not None:
+    config['max_attempts'] = retry_options.task_retry_limit
+  if retry_options.task_age_limit is not None:
+    config['max_retry_duration'] = _to_duration(retry_options.task_age_limit)
+  if retry_options.min_backoff_seconds is not None:
+    config['min_backoff'] = _to_duration(retry_options.min_backoff_seconds)
+  if retry_options.max_backoff_seconds is not None:
+    config['max_backoff'] = _to_duration(retry_options.max_backoff_seconds)
+  if retry_options.max_doublings is not None:
+    config['max_doublings'] = retry_options.max_doublings
+
+  if config:
+    return config
+  return None
+
+
+def _build_ct_task_payload(queue_name, task, client, project, region):
+  """Builds the Cloud Tasks Task proto payload from GAE Task."""
   default_hostname = app_identity.get_default_version_hostname()
   target_service = task.target or os.environ.get('GAE_SERVICE')
 
@@ -81,18 +104,20 @@ def create_task_in_cloud_tasks(queue_name, task, multiple):
   if target_service and target_service.endswith('-dot'):
     target_service = target_service[:-4]
 
-  if target_service and target_service != 'default':
-    url_host = f"{target_service}-dot-{default_hostname}"
-  else:
-    url_host = default_hostname
+  headers = {}
+  if task.headers:
+    headers = dict(task.headers)
 
-  # Ensure task.url starts with /
-  relative_uri = task.url or '/'
-  if not relative_uri.startswith('/'):
-    relative_uri = '/' + relative_uri
+  headers['X-AppEngine-QueueName'] = queue_name
+  if task.name:
+    headers['X-AppEngine-TaskName'] = task.name
 
-  url = f"https://{url_host}{relative_uri}"
-  print(f"Jetski: Constructed Cloud Tasks URL (refactored): {url}", flush=True)
+  body = b''
+  if task.payload:
+    if isinstance(task.payload, str):
+      body = task.payload.encode('utf-8')
+    else:
+      body = task.payload
 
   http_method = tasks_v2beta3.HttpMethod.POST
   if task.method:
@@ -105,23 +130,6 @@ def create_task_in_cloud_tasks(queue_name, task, multiple):
     }
     http_method = method_map.get(task.method, tasks_v2beta3.HttpMethod.POST)
 
-  headers = {}
-  if task.headers:
-    headers = dict(task.headers)
-
-  # Manually inject GAE headers for compatibility with the test app
-  headers['X-AppEngine-QueueName'] = queue_name
-  if task.name:
-    headers['X-AppEngine-TaskName'] = task.name
-
-  body = b''
-  if task.payload:
-    if isinstance(task.payload, str):
-      body = task.payload.encode('utf-8')
-    else:
-      body = task.payload
-
-  # Construct AppEngineHttpRequest
   app_engine_http_request = {
       'http_method': http_method,
       'relative_uri': task.url or '/',
@@ -132,21 +140,9 @@ def create_task_in_cloud_tasks(queue_name, task, multiple):
   routing = {}
   if target_service:
     routing['service'] = target_service
-    # Also set version to see if it bypasses the regional routing bug
     version = os.environ.get('GAE_VERSION')
     if version:
       routing['version'] = version
-    print(
-        f"Jetski: Using AppEngineHttpRequest with routing (refactored):"
-        f" service={target_service}, version={version}",
-        flush=True,
-    )
-  else:
-    print(
-        'Jetski: Using AppEngineHttpRequest with default routing'
-        ' (refactored)',
-        flush=True,
-    )
 
   if routing:
     app_engine_http_request['app_engine_routing'] = routing
@@ -155,13 +151,6 @@ def create_task_in_cloud_tasks(queue_name, task, multiple):
 
   if task.name:
     ct_task['name'] = client.task_path(project, region, queue_name, task.name)
-
-  if task.retry_options:
-    import logging
-    logging.warning(
-        "Jetski: Per-task retry_options are ignored by the CLOUD_TASK backend. "
-        "Please configure retry settings at the queue level instead."
-    )
 
   if task.eta:
     epoch = datetime.datetime.utcfromtimestamp(0)
@@ -173,6 +162,25 @@ def create_task_in_cloud_tasks(queue_name, task, multiple):
     nanos = int(delta.microseconds * 1000)
     timestamp = Timestamp(seconds=seconds, nanos=nanos)
     ct_task['schedule_time'] = timestamp
+
+  if task.retry_options:
+    retry_config = _build_retry_config(task.retry_options)
+    if retry_config:
+      ct_task['retry_config'] = retry_config
+
+  return ct_task
+
+
+def _create_single_task_in_cloud_tasks(queue_name, task, multiple):
+  """Helper to create a single task using CreateTask API."""
+  client = tasks_v2beta3.CloudTasksClient()
+  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  if project and (project.startswith('s~') or project.startswith('e~')):
+    project = project[2:]
+  region = _get_region()
+
+  parent = client.queue_path(project, region, queue_name)
+  ct_task = _build_ct_task_payload(queue_name, task, client, project, region)
 
   try:
     response = client.create_task(request={'parent': parent, 'task': ct_task})
@@ -189,6 +197,68 @@ def create_task_in_cloud_tasks(queue_name, task, multiple):
     raise TaskAlreadyExistsError(str(e))
   except Exception as e:
     raise e
+
+
+def _create_batch_tasks_in_cloud_tasks(queue_name, tasks, multiple):
+  """Helper to create tasks in batches of up to 100 using BatchCreateTasks API."""
+  client = tasks_v2beta3.CloudTasksClient()
+  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  if project and (project.startswith('s~') or project.startswith('e~')):
+    project = project[2:]
+  region = _get_region()
+
+  parent = client.queue_path(project, region, queue_name)
+
+  # Check pre-conditions
+  task_names = set()
+  for task in tasks:
+    if task.name:
+      if task.name in task_names:
+        from google.appengine.api.taskqueue.taskqueue import DuplicateTaskNameError
+        raise DuplicateTaskNameError(
+            'The task name %s is duplicated' % task.name
+        )
+      task_names.add(task.name)
+
+  created_tasks = []
+  chunk_size = 100
+  for i in range(0, len(tasks), chunk_size):
+    batch = tasks[i : i + chunk_size]
+    requests_payload = []
+    for t in batch:
+      ct_task_payload = _build_ct_task_payload(
+          queue_name, t, client, project, region
+      )
+      requests_payload.append({'parent': parent, 'task': ct_task_payload})
+
+    try:
+      response = client.batch_create_tasks(
+          request={'parent': parent, 'requests': requests_payload}
+      )
+      for t, res_task in zip(batch, response.tasks):
+        task_id = res_task.name.split('/')[-1]
+        t._Task__name = task_id
+        t._Task__queue_name = queue_name
+        t._Task__enqueued = True
+        created_tasks.append(t)
+    except google_exceptions.AlreadyExists as e:
+      from google.appengine.api.taskqueue.taskqueue import TaskAlreadyExistsError
+      raise TaskAlreadyExistsError(str(e))
+    except Exception as e:
+      raise e
+
+  if multiple:
+    return created_tasks
+  else:
+    return created_tasks[0]
+
+
+def create_tasks_in_cloud_tasks(queue_name, tasks, multiple):
+  """Creates one or more tasks using Cloud Tasks API (supporting BatchCreateTasks)."""
+  if len(tasks) == 1:
+    return _create_single_task_in_cloud_tasks(queue_name, tasks[0], multiple)
+  else:
+    return _create_batch_tasks_in_cloud_tasks(queue_name, tasks, multiple)
 
 
 def purge_queue_in_cloud_tasks(queue_name):
@@ -211,15 +281,17 @@ def purge_queue_in_cloud_tasks(queue_name):
 
 
 def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
-  """Deletes tasks from a queue using Cloud Tasks API."""
+  """Deletes tasks from a queue using Cloud Tasks API (supporting BatchDeleteTasks)."""
   client = tasks_v2beta3.CloudTasksClient()
   project = os.environ.get('GOOGLE_CLOUD_PROJECT')
   if project and (project.startswith('s~') or project.startswith('e~')):
     project = project[2:]
   region = _get_region()
 
+  parent = client.queue_path(project, region, queue_name)
+
   # Check pre-conditions (duplicate names or already deleted)
-  task_names = set()
+  task_names_set = set()
   for task in tasks:
     if not task.name:
       from google.appengine.api.taskqueue.taskqueue import BadTaskStateError
@@ -229,40 +301,58 @@ def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
       raise BadTaskStateError(
           'The task %s has already been deleted' % task.name
       )
-    if task.name in task_names:
+    if task.name in task_names_set:
       from google.appengine.api.taskqueue.taskqueue import DuplicateTaskNameError
       raise DuplicateTaskNameError(
           'The task name %s is duplicated' % task.name
       )
-    task_names.add(task.name)
+    task_names_set.add(task.name)
 
-  exception = None
-  for task in tasks:
-    name = client.task_path(project, region, queue_name, task.name)
+  chunk_size = 100
+  for i in range(0, len(tasks), chunk_size):
+    batch = tasks[i : i + chunk_size]
+    task_names = [
+        client.task_path(project, region, queue_name, t.name) for t in batch
+    ]
+
     try:
-      client.delete_task(request={'name': name})
-      task._Task__deleted = True
+      operation = client.batch_delete_tasks(
+          request={'parent': parent, 'names': task_names}
+      )
       print(
-          f"Jetski: Successfully deleted task {task.name} using Cloud Tasks",
+          f"Jetski: Started BatchDeleteTasks operation: {operation.operation.name}",
           flush=True,
       )
-    except google_exceptions.NotFound:
-      # Already deleted or completed, corresponding to UNKNOWN_TASK/TOMBSTONED_TASK
-      task._Task__deleted = False
-      print(
-          f"Jetski: Task {task.name} not found (already processed/deleted)"
-          " during deletion",
-          flush=True,
-      )
-    except Exception as e:
-      if exception is None:
-        exception = e
 
-  if exception is not None:
-    raise exception
+      # Block until done
+      operation.result()
+
+      # Mark all as deleted
+      for t in batch:
+        t._Task__deleted = True
+        print(
+            f"Jetski: Successfully deleted task {t.name} using Cloud Tasks"
+            " BatchDelete",
+            flush=True,
+        )
+
+    except google_exceptions.NotFound:
+      print(
+          "Jetski: BatchDelete failed with NotFound, falling back to"
+          " individual deletes to map success/fail",
+          flush=True,
+      )
+      for t in batch:
+        name = client.task_path(project, region, queue_name, t.name)
+        try:
+          client.delete_task(request={'name': name})
+          t._Task__deleted = True
+        except google_exceptions.NotFound:
+          t._Task__deleted = False
+    except Exception as e:
+      raise e
 
   if multiple:
     return tasks
   else:
     return tasks[0]
-

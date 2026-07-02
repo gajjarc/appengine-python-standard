@@ -2148,12 +2148,12 @@ class Queue(object):
     import os
     if (os.environ.get('GAE_PUSHQUEUE_BACKEND') == 'CLOUD_TASK'
         and has_push_task
-        and len(tasks) == 1):
+        and len(tasks) >= 1):
       if transactional:
         raise NotImplementedError(
             'Transactional tasks are not supported with CLOUD_TASK backend.')
       from google.appengine.api.taskqueue import cloudtask
-      result = cloudtask.create_task_in_cloud_tasks(self.__name, tasks[0], multiple)
+      result = cloudtask.create_tasks_in_cloud_tasks(self.__name, tasks, multiple)
       return cloudtask._DummyRPC(lambda: result)
 
     if has_push_task:
