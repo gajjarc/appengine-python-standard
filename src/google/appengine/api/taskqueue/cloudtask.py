@@ -345,6 +345,35 @@ def _execute_rest_batch_delete(project, region, queue_name, task_names):
     )
 
 
+def _execute_rest_create_task(project, region, queue_name, task_payload):
+  """Calls the CreateTask REST API."""
+  url = f"https://cloudtasks.googleapis.com/v2beta3/projects/{project}/locations/{region}/queues/{queue_name}/tasks"
+
+  headers = _get_auth_headers()
+  payload = {"task": task_payload}
+
+  data = json.dumps(payload).encode('utf-8')
+  req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+
+  try:
+    with urllib.request.urlopen(req) as response:
+      resp_body = response.read().decode('utf-8')
+      return json.loads(resp_body)
+  except urllib.error.HTTPError as e:
+    resp_body = e.read().decode('utf-8') if e else ""
+    try:
+      error_json = json.loads(resp_body)
+      error_msg = error_json.get('error', {}).get('message', str(e))
+      error_code = error_json.get('error', {}).get('code', e.code)
+    except:
+      error_msg = resp_body or str(e)
+      error_code = e.code
+
+    raise google_exceptions.from_http_status_and_reason(
+        error_code, error_msg, response_body=resp_body
+    )
+
+
 def _create_single_task_in_cloud_tasks(queue_name, task, multiple):
   """Helper to create a single task using CreateTask API."""
   client = tasks_v2beta3.CloudTasksClient()
@@ -355,10 +384,11 @@ def _create_single_task_in_cloud_tasks(queue_name, task, multiple):
 
   parent = client.queue_path(project, region, queue_name)
   ct_task = _build_ct_task_payload(queue_name, task, client, project, region)
+  rest_task = _convert_to_rest_payload(ct_task)
 
   try:
-    response = client.create_task(request={'parent': parent, 'task': ct_task})
-    task_id = response.name.split('/')[-1]
+    response = _execute_rest_create_task(project, region, queue_name, rest_task)
+    task_id = response['name'].split('/')[-1]
     task._Task__name = task_id
     task._Task__queue_name = queue_name
     task._Task__enqueued = True
