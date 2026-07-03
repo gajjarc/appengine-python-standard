@@ -388,9 +388,17 @@ def _create_single_task_in_cloud_tasks(queue_name, task, multiple):
       return [task]
     else:
       return task
-  except google_exceptions.AlreadyExists as e:
+  except (google_exceptions.AlreadyExists, google_exceptions.Conflict) as e:
     from google.appengine.api.taskqueue.taskqueue import TaskAlreadyExistsError
     raise TaskAlreadyExistsError(str(e))
+  except google_exceptions.NotFound as e:
+    from google.appengine.api.taskqueue.taskqueue import UnknownQueueError
+    raise UnknownQueueError(str(e))
+  except google_exceptions.BadRequest as e:
+    if 'Queue does not exist' in str(e):
+      from google.appengine.api.taskqueue.taskqueue import UnknownQueueError
+      raise UnknownQueueError(str(e))
+    raise e
   except Exception as e:
     raise e
 
@@ -438,9 +446,17 @@ def _create_batch_tasks_in_cloud_tasks(queue_name, tasks, multiple):
         t._Task__queue_name = queue_name
         t._Task__enqueued = True
         created_tasks.append(t)
-    except google_exceptions.AlreadyExists as e:
+    except (google_exceptions.AlreadyExists, google_exceptions.Conflict) as e:
       from google.appengine.api.taskqueue.taskqueue import TaskAlreadyExistsError
       raise TaskAlreadyExistsError(str(e))
+    except google_exceptions.NotFound as e:
+      from google.appengine.api.taskqueue.taskqueue import UnknownQueueError
+      raise UnknownQueueError(str(e))
+    except google_exceptions.BadRequest as e:
+      if 'Queue does not exist' in str(e):
+        from google.appengine.api.taskqueue.taskqueue import UnknownQueueError
+        raise UnknownQueueError(str(e))
+      raise e
     except Exception as e:
       raise e
 
