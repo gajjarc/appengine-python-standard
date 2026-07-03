@@ -46,6 +46,7 @@ from google.appengine.api import namespace_manager
 from google.appengine.api import urlfetch
 from google.appengine.api.taskqueue import taskqueue_service_bytes_pb2 as taskqueue_service_pb2
 from google.appengine.runtime import apiproxy_errors
+from google.appengine.api.taskqueue import cloudtask
 from google.appengine.runtime import context
 import six
 from six.moves import urllib
@@ -2150,11 +2151,11 @@ class Queue(object):
         and has_push_task
         and len(tasks) >= 1):
       if transactional:
-        raise NotImplementedError(
-            'Transactional tasks are not supported with CLOUD_TASK backend.')
-      from google.appengine.api.taskqueue import cloudtask
-      result = cloudtask.create_tasks_in_cloud_tasks(self.__name, tasks, multiple)
-      return cloudtask._DummyRPC(lambda: result)
+        cloudtask.add_transactional_tasks(self.__name, tasks, multiple)
+        return cloudtask._DummyRPC(lambda: tasks if multiple else tasks[0])
+      else:
+        result = cloudtask.create_tasks_in_cloud_tasks(self.__name, tasks, multiple)
+        return cloudtask._DummyRPC(lambda: result)
 
     if has_push_task:
       fill_function = self.__FillAddPushTasksRequest

@@ -564,3 +564,138 @@ def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
     return tasks
   else:
     return tasks[0]
+
+
+def build_rest_payload_for_transactional_task(queue_name, task):
+  """Builds the REST task payload for a transactional task."""
+  client = tasks_v2beta3.CloudTasksClient()
+  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  if project and (project.startswith('s~') or project.startswith('e~')):
+    project = project[2:]
+  region = _get_region()
+
+  ct_task = _build_ct_task_payload(queue_name, task, client, project, region)
+  return _convert_to_rest_payload(ct_task)
+
+
+def dispatch_rest_task(queue_name, task_payload):
+  """Dispatches a pre-built REST task payload immediately."""
+  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  if project and (project.startswith('s~') or project.startswith('e~')):
+    project = project[2:]
+  region = _get_region()
+  _execute_rest_create_task(project, region, queue_name, task_payload)
+
+
+import threading
+import logging
+from google.appengine.api import datastore
+
+_transaction_pending_keys = threading.local()
+
+
+def _get_tx_pending():
+  return getattr(_transaction_pending_keys, 'keys', None)
+
+
+def _start_tx_context():
+  prev = getattr(_transaction_pending_keys, 'keys', None)
+  _transaction_pending_keys.keys = []
+  return prev
+
+
+def _restore_tx_context(prev):
+  _transaction_pending_keys.keys = prev
+
+
+def _dispatch_pending_keys_now(pending_keys):
+  try:
+    entities = datastore.Get(pending_keys)
+  except Exception as e:
+    logging.error("Failed to fetch pending transactional tasks: %s", e)
+    return
+
+  for entity in entities:
+    if not entity:
+      continue
+    queue_name = entity['queue_name']
+    payload_str = entity['payload']
+    task_name = entity.get('task_name')
+
+    try:
+      payload = json.loads(payload_str)
+      dispatch_rest_task(queue_name, payload)
+      datastore.Delete(entity.key())
+      logging.info("Successfully dispatched transactional task %s", task_name)
+    except Exception as e:
+      logging.error(
+          "Failed to dispatch transactional task %s: %s", task_name, e
+      )
+
+
+def _register_post_commit_dispatch(queue_name, pending_keys):
+  try:
+    from google.appengine.ext import ndb
+
+    if ndb.in_transaction():
+      ndb.get_context().call_on_commit(
+          lambda: _dispatch_pending_keys_now(pending_keys)
+      )
+      return
+  except ImportError:
+    pass
+
+  tx_pending = _get_tx_pending()
+  if tx_pending is not None:
+    tx_pending.extend(pending_keys)
+  else:
+    from google.appengine.api.taskqueue.taskqueue import InvalidRequestError
+
+    raise InvalidRequestError(
+        'Transactional tasks must be added inside a transaction.'
+    )
+
+
+def _patched_RunInTransaction(function, *args, **kwargs):
+  prev_context = _start_tx_context()
+  try:
+    result = _original_RunInTransaction(function, *args, **kwargs)
+    pending_keys = _get_tx_pending()
+    if pending_keys:
+      _dispatch_pending_keys_now(pending_keys)
+    return result
+  finally:
+    _restore_tx_context(prev_context)
+
+
+_original_RunInTransaction = datastore.RunInTransaction
+datastore.RunInTransaction = _patched_RunInTransaction
+
+
+def add_transactional_tasks(queue_name, tasks, multiple):
+  """Enqueues transactional tasks into Datastore outbox."""
+  # Generate names for unnamed tasks so they are immediately available
+  for t in tasks:
+    if not t.name:
+      import uuid
+
+      t._Task__name = "task-" + str(uuid.uuid4())
+
+  rest_tasks = []
+  for t in tasks:
+    ct_payload = build_rest_payload_for_transactional_task(queue_name, t)
+    rest_tasks.append((t.name, ct_payload))
+
+  pending_keys = []
+  for t_name, payload in rest_tasks:
+    entity = datastore.Entity('_PendingCloudTask')
+    entity['queue_name'] = queue_name
+    entity['task_name'] = t_name
+    entity['payload'] = json.dumps(payload)
+    entity['created'] = datetime.datetime.utcnow()
+    datastore.Put(entity)
+    pending_keys.append(entity.key())
+
+  _register_post_commit_dispatch(queue_name, pending_keys)
+
+
