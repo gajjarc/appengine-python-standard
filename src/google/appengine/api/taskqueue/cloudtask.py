@@ -614,13 +614,13 @@ import contextlib
 @contextlib.contextmanager
 def _use_default_datastore_adapter():
   conn = datastore._GetConnection()
-  orig_adapter = getattr(conn, 'adapter', None)
+  orig_adapter = getattr(conn, '_Connection__adapter', None)
   if orig_adapter is not None:
-    conn.adapter = datastore._adapter
+    conn._Connection__adapter = datastore._adapter
     try:
       yield
     finally:
-      conn.adapter = orig_adapter
+      conn._Connection__adapter = orig_adapter
   else:
     yield
 
