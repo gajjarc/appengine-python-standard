@@ -279,9 +279,7 @@ def _wait_for_operation(operation_json):
       except:
         error_msg = resp_body or str(e)
         error_code = e.code
-      raise google_exceptions.from_http_status(
-          error_code, error_msg, response_body=resp_body
-      )
+      raise google_exceptions.from_http_status(error_code, error_msg)
 
     time.sleep(1)
 
@@ -310,9 +308,7 @@ def _execute_rest_batch_create(project, region, queue_name, tasks_payload):
       error_msg = resp_body or str(e)
       error_code = e.code
 
-    raise google_exceptions.from_http_status(
-        error_code, error_msg, response_body=resp_body
-    )
+    raise google_exceptions.from_http_status(error_code, error_msg)
 
 
 def _execute_rest_batch_delete(project, region, queue_name, task_names):
@@ -340,9 +336,7 @@ def _execute_rest_batch_delete(project, region, queue_name, task_names):
     except:
       error_msg = resp_body or str(e)
       error_code = e.code
-    raise google_exceptions.from_http_status(
-        error_code, error_msg, response_body=resp_body
-    )
+    raise google_exceptions.from_http_status(error_code, error_msg)
 
 
 def _execute_rest_create_task(project, region, queue_name, task_payload):
@@ -369,9 +363,7 @@ def _execute_rest_create_task(project, region, queue_name, task_payload):
       error_msg = resp_body or str(e)
       error_code = e.code
 
-    raise google_exceptions.from_http_status(
-        error_code, error_msg, response_body=resp_body
-    )
+    raise google_exceptions.from_http_status(error_code, error_msg)
 
 
 def _create_single_task_in_cloud_tasks(queue_name, task, multiple):
