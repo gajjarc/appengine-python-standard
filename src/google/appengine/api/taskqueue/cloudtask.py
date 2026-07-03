@@ -86,7 +86,7 @@ def _build_retry_config(retry_options):
   config = {}
 
   if retry_options.task_retry_limit is not None:
-    config['max_attempts'] = retry_options.task_retry_limit
+    config['max_attempts'] = retry_options.task_retry_limit + 1
   if retry_options.task_age_limit is not None:
     config['max_retry_duration'] = _to_duration(retry_options.task_age_limit)
   if retry_options.min_backoff_seconds is not None:
@@ -266,7 +266,7 @@ def _wait_for_operation(operation_json):
         if op_status.get('done', False):
           if 'error' in op_status:
             err = op_status['error']
-            raise google_exceptions.from_http_status_and_reason(
+            raise google_exceptions.from_http_status(
                 err.get('code', 500), err.get('message', 'Operation failed')
             )
           return op_status
@@ -279,7 +279,7 @@ def _wait_for_operation(operation_json):
       except:
         error_msg = resp_body or str(e)
         error_code = e.code
-      raise google_exceptions.from_http_status_and_reason(
+      raise google_exceptions.from_http_status(
           error_code, error_msg, response_body=resp_body
       )
 
@@ -310,7 +310,7 @@ def _execute_rest_batch_create(project, region, queue_name, tasks_payload):
       error_msg = resp_body or str(e)
       error_code = e.code
 
-    raise google_exceptions.from_http_status_and_reason(
+    raise google_exceptions.from_http_status(
         error_code, error_msg, response_body=resp_body
     )
 
@@ -340,7 +340,7 @@ def _execute_rest_batch_delete(project, region, queue_name, task_names):
     except:
       error_msg = resp_body or str(e)
       error_code = e.code
-    raise google_exceptions.from_http_status_and_reason(
+    raise google_exceptions.from_http_status(
         error_code, error_msg, response_body=resp_body
     )
 
@@ -369,7 +369,7 @@ def _execute_rest_create_task(project, region, queue_name, task_payload):
       error_msg = resp_body or str(e)
       error_code = e.code
 
-    raise google_exceptions.from_http_status_and_reason(
+    raise google_exceptions.from_http_status(
         error_code, error_msg, response_body=resp_body
     )
 
