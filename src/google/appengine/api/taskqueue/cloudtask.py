@@ -608,9 +608,27 @@ def _restore_tx_context(prev):
   _transaction_pending_keys.keys = prev
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _use_default_datastore_adapter():
+  conn = datastore._GetConnection()
+  orig_adapter = getattr(conn, 'adapter', None)
+  if orig_adapter is not None:
+    conn.adapter = datastore._adapter
+    try:
+      yield
+    finally:
+      conn.adapter = orig_adapter
+  else:
+    yield
+
+
 def _dispatch_pending_keys_now(pending_keys):
   try:
-    entities = datastore.Get(pending_keys)
+    with _use_default_datastore_adapter():
+      entities = datastore.Get(pending_keys)
   except Exception as e:
     logging.error("Failed to fetch pending transactional tasks: %s", e)
     return
@@ -625,7 +643,8 @@ def _dispatch_pending_keys_now(pending_keys):
     try:
       payload = json.loads(payload_str)
       dispatch_rest_task(queue_name, payload)
-      datastore.Delete(entity.key())
+      with _use_default_datastore_adapter():
+        datastore.Delete(entity.key())
       logging.info("Successfully dispatched transactional task %s", task_name)
     except Exception as e:
       logging.error(
@@ -649,9 +668,9 @@ def _register_post_commit_dispatch(queue_name, pending_keys):
   if tx_pending is not None:
     tx_pending.extend(pending_keys)
   else:
-    from google.appengine.api.taskqueue.taskqueue import InvalidRequestError
+    from google.appengine.api.taskqueue.taskqueue import BadTransactionStateError
 
-    raise InvalidRequestError(
+    raise BadTransactionStateError(
         'Transactional tasks must be added inside a transaction.'
     )
 
@@ -693,7 +712,8 @@ def add_transactional_tasks(queue_name, tasks, multiple):
     entity['task_name'] = t_name
     entity['payload'] = json.dumps(payload)
     entity['created'] = datetime.datetime.utcnow()
-    datastore.Put(entity)
+    with _use_default_datastore_adapter():
+      datastore.Put(entity)
     pending_keys.append(entity.key())
 
   _register_post_commit_dispatch(queue_name, pending_keys)
