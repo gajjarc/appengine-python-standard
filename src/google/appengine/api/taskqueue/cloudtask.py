@@ -521,7 +521,7 @@ def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
       )
     task_names_set.add(task.name)
 
-  chunk_size = 100
+  chunk_size = 1000
   for i in range(0, len(tasks), chunk_size):
     batch = tasks[i : i + chunk_size]
     task_names = [
@@ -646,6 +646,10 @@ def _dispatch_pending_keys_now(pending_keys):
       with _use_default_datastore_adapter():
         datastore.Delete(entity.key())
       logging.info("Successfully dispatched transactional task %s", task_name)
+    except (google_exceptions.AlreadyExists, google_exceptions.Conflict):
+      with _use_default_datastore_adapter():
+        datastore.Delete(entity.key())
+      logging.info("Transactional task %s already exists in Cloud Tasks; cleaned up entity", task_name)
     except Exception as e:
       logging.error(
           "Failed to dispatch transactional task %s: %s", task_name, e
@@ -712,10 +716,53 @@ def add_transactional_tasks(queue_name, tasks, multiple):
     entity['task_name'] = t_name
     entity['payload'] = json.dumps(payload)
     entity['created'] = datetime.datetime.utcnow()
+    entity['status'] = 'PENDING'
     with _use_default_datastore_adapter():
       datastore.Put(entity)
     pending_keys.append(entity.key())
 
   _register_post_commit_dispatch(queue_name, pending_keys)
+
+
+def sweep():
+  """Queries Datastore for pending Cloud Tasks and dispatches them."""
+  try:
+    with _use_default_datastore_adapter():
+      query = datastore.Query('_PendingCloudTask')
+      entities = query.Run()
+  except Exception as e:
+    logging.error("Failed to query _PendingCloudTask in sweeper: %s", e)
+    return
+
+  now = datetime.datetime.utcnow()
+  keys_to_dispatch = []
+  for entity in entities:
+    if not entity:
+      continue
+    created = entity.get('created')
+    if created and isinstance(created, datetime.datetime):
+      if (now - created).total_seconds() < 60:
+        continue
+    keys_to_dispatch.append(entity.key())
+
+  if keys_to_dispatch:
+    logging.info("Cloud Tasks sweeper found %d tasks to process.", len(keys_to_dispatch))
+    _dispatch_pending_keys_now(keys_to_dispatch)
+
+
+def sweep_wsgi_app(environ, start_response):
+  """WSGI app handler for /_ah/cloudtask/sweep."""
+  try:
+    sweep()
+    status = '200 OK'
+    response_headers = [('Content-Type', 'text/plain')]
+    start_response(status, response_headers)
+    return [b'Sweeper completed successfully.\n']
+  except Exception as e:
+    logging.error("Cloud Tasks sweeper failed: %s", e)
+    status = '500 Internal Server Error'
+    response_headers = [('Content-Type', 'text/plain')]
+    start_response(status, response_headers)
+    return [f'Sweeper failed: {e}\n'.encode('utf-8')]
 
 
