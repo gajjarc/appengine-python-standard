@@ -638,8 +638,8 @@ def _dispatch_pending_keys_now(pending_keys, handled_by_sweeper=False):
     if not entity:
       continue
     queue_name = entity.get('queue_name')
-    payload_str = entity.get('cloud_task_payload') or entity.get('payload')
-    task_name = entity.get('cloud_task_name') or entity.get('task_name')
+    payload_str = entity.get('cloud_task_payload')
+    task_name = entity.get('cloud_task_name')
 
     if not payload_str or not queue_name:
       continue
