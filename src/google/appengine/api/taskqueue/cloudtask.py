@@ -711,7 +711,7 @@ def add_transactional_tasks(queue_name, tasks, multiple):
 
   pending_keys = []
   for t_name, payload in rest_tasks:
-    entity = datastore.Entity('_PendingCloudTask')
+    entity = datastore.Entity('_AE_PendingCloudTask')
     entity['queue_name'] = queue_name
     entity['task_name'] = t_name
     entity['payload'] = json.dumps(payload)
@@ -728,10 +728,10 @@ def sweep():
   """Queries Datastore for pending Cloud Tasks and dispatches them."""
   try:
     with _use_default_datastore_adapter():
-      query = datastore.Query('_PendingCloudTask')
+      query = datastore.Query('_AE_PendingCloudTask')
       entities = query.Run()
   except Exception as e:
-    logging.error("Failed to query _PendingCloudTask in sweeper: %s", e)
+    logging.error("Failed to query _AE_PendingCloudTask in sweeper: %s", e)
     return
 
   now = datetime.datetime.utcnow()
