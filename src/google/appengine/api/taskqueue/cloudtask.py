@@ -625,7 +625,7 @@ def _use_default_datastore_adapter():
     yield
 
 
-def _dispatch_pending_keys_now(pending_keys):
+def _dispatch_pending_keys_now(pending_keys, handled_by_sweeper=False):
   try:
     with _use_default_datastore_adapter():
       entities = datastore.Get(pending_keys)
@@ -633,12 +633,28 @@ def _dispatch_pending_keys_now(pending_keys):
     logging.error("Failed to fetch pending transactional tasks: %s", e)
     return
 
+  now = datetime.datetime.utcnow()
   for entity in entities:
     if not entity:
       continue
-    queue_name = entity['queue_name']
-    payload_str = entity['payload']
-    task_name = entity.get('task_name')
+    queue_name = entity.get('queue_name')
+    payload_str = entity.get('cloud_task_payload') or entity.get('payload')
+    task_name = entity.get('cloud_task_name') or entity.get('task_name')
+
+    if not payload_str or not queue_name:
+      continue
+
+    # Acquire lock if handled by sweeper
+    if handled_by_sweeper:
+      try:
+        entity['status'] = 'PROCESSING'
+        entity['lock_expires'] = now + datetime.timedelta(seconds=60)
+        entity['handled_by_sweeper'] = True
+        with _use_default_datastore_adapter():
+          datastore.Put(entity)
+      except Exception as e:
+        logging.warning("Failed to acquire lock for task %s: %s", task_name, e)
+        continue
 
     try:
       payload = json.loads(payload_str)
@@ -654,6 +670,20 @@ def _dispatch_pending_keys_now(pending_keys):
       logging.error(
           "Failed to dispatch transactional task %s: %s", task_name, e
       )
+      retry_count = entity.get('retry_count', 0) + 1
+      entity['retry_count'] = retry_count
+      entity['last_error'] = str(e)[:500]
+      if retry_count >= 5:
+        entity['status'] = 'FAILED'
+        entity['lock_expires'] = None
+      else:
+        entity['status'] = 'PENDING'
+        entity['lock_expires'] = None
+      try:
+        with _use_default_datastore_adapter():
+          datastore.Put(entity)
+      except Exception as put_err:
+        logging.error("Failed to record error state for task %s: %s", task_name, put_err)
 
 
 def _register_post_commit_dispatch(queue_name, pending_keys):
@@ -713,10 +743,15 @@ def add_transactional_tasks(queue_name, tasks, multiple):
   for t_name, payload in rest_tasks:
     entity = datastore.Entity('_AE_PendingCloudTask')
     entity['queue_name'] = queue_name
-    entity['task_name'] = t_name
-    entity['payload'] = json.dumps(payload)
+    entity['cloud_task_name'] = t_name
+    entity['cloud_task_payload'] = json.dumps(payload)
     entity['created'] = datetime.datetime.utcnow()
     entity['status'] = 'PENDING'
+    entity['lock_expires'] = None
+    entity['retry_count'] = 0
+    entity['last_error'] = ''
+    entity['handled_by_sweeper'] = False
+    entity['sdk_lang'] = 'PYTHON'
     with _use_default_datastore_adapter():
       datastore.Put(entity)
     pending_keys.append(entity.key())
@@ -739,19 +774,42 @@ def sweep():
   for entity in entities:
     if not entity:
       continue
+    status = entity.get('status', 'PENDING')
+    if status == 'DONE':
+      continue
+    if status == 'PROCESSING':
+      lock_expires = entity.get('lock_expires')
+      if lock_expires and isinstance(lock_expires, datetime.datetime):
+        if now < lock_expires:
+          continue  # still actively processing and lock valid
+      elif not lock_expires:
+        continue  # assume lock valid if just started
+
     created = entity.get('created')
-    if created and isinstance(created, datetime.datetime):
+    if status == 'PENDING' and created and isinstance(created, datetime.datetime):
       if (now - created).total_seconds() < 60:
-        continue
+        continue  # give fast-path 60s to dispatch post-commit
+
+    retry_count = entity.get('retry_count', 0)
+    if status == 'FAILED' and retry_count >= 5:
+      continue  # exceeded max sweeper retries
+
     keys_to_dispatch.append(entity.key())
 
   if keys_to_dispatch:
     logging.info("Cloud Tasks sweeper found %d tasks to process.", len(keys_to_dispatch))
-    _dispatch_pending_keys_now(keys_to_dispatch)
+    _dispatch_pending_keys_now(keys_to_dispatch, handled_by_sweeper=True)
 
 
 def sweep_wsgi_app(environ, start_response):
   """WSGI app handler for /_ah/cloudtask/sweep."""
+  is_cron = str(environ.get('HTTP_X_APPENGINE_CRON', '')).lower() == 'true' or str(environ.get('X-AppEngine-Cron', '')).lower() == 'true'
+  if not is_cron and not str(environ.get('SERVER_SOFTWARE', '')).lower().startswith('dev'):
+    status = '403 Forbidden'
+    response_headers = [('Content-Type', 'text/plain')]
+    start_response(status, response_headers)
+    return [b'Access denied: endpoint only accessible via App Engine Cron.\n']
+
   try:
     sweep()
     status = '200 OK'
