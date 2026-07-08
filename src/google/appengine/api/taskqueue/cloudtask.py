@@ -644,17 +644,16 @@ def _dispatch_pending_keys_now(pending_keys, handled_by_sweeper=False):
     if not payload_str or not queue_name:
       continue
 
-    # Acquire lock if handled by sweeper
-    if handled_by_sweeper:
-      try:
-        entity['status'] = 'PROCESSING'
-        entity['lock_expires'] = now + datetime.timedelta(seconds=60)
-        entity['handled_by_sweeper'] = True
-        with _use_default_datastore_adapter():
-          datastore.Put(entity)
-      except Exception as e:
-        logging.warning("Failed to acquire lock for task %s: %s", task_name, e)
-        continue
+    # Unconditionally acquire transactional lease before dispatching
+    try:
+      entity['status'] = 'PROCESSING'
+      entity['lock_expires'] = now + datetime.timedelta(seconds=60)
+      entity['handled_by_sweeper'] = handled_by_sweeper
+      with _use_default_datastore_adapter():
+        datastore.Put(entity)
+    except Exception as e:
+      logging.warning("Failed to acquire lock for task %s: %s", task_name, e)
+      continue
 
     try:
       payload = json.loads(payload_str)
