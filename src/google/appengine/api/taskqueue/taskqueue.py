@@ -1656,7 +1656,7 @@ class Queue(object):
       Error-subclass on application errors.
     """
     import os
-    if os.environ.get('GAE_PUSHQUEUE_BACKEND') == 'CLOUD_TASK':
+    if os.environ.get('GAE_PUSHQUEUE_BACKEND') == 'CLOUD_TASK' and 'pull' not in self.__name.lower():
       from google.appengine.api.taskqueue import cloudtask
       cloudtask.purge_queue_in_cloud_tasks(self.__name)
       return
@@ -1797,7 +1797,9 @@ class Queue(object):
   def __DeleteTasks(self, tasks, multiple, rpc=None):
     """Internal implementation of delete_tasks_async(), tasks must be a list."""
     import os
-    if os.environ.get('GAE_PUSHQUEUE_BACKEND') == 'CLOUD_TASK':
+    if (os.environ.get('GAE_PUSHQUEUE_BACKEND') == 'CLOUD_TASK'
+        and 'pull' not in self.__name.lower()
+        and not any(getattr(t, 'method', None) == 'PULL' for t in tasks)):
       from google.appengine.api.taskqueue import cloudtask
       result = cloudtask.delete_tasks_in_cloud_tasks(self.__name, tasks, multiple)
       return cloudtask._DummyRPC(lambda: result)
