@@ -266,9 +266,11 @@ def _wait_for_operation(operation_json):
         if op_status.get('done', False):
           if 'error' in op_status:
             err = op_status['error']
-            raise google_exceptions.from_http_status(
-                err.get('code', 500), err.get('message', 'Operation failed')
-            )
+            code = err.get('code', 500)
+            if code != 10:
+              raise google_exceptions.from_http_status(
+                  code, err.get('message', 'Operation failed')
+              )
           return op_status
     except urllib.error.HTTPError as e:
       resp_body = e.read().decode('utf-8') if e else ""
@@ -325,8 +327,7 @@ def _execute_rest_batch_delete(project, region, queue_name, task_names):
     with urllib.request.urlopen(req) as response:
       resp_body = response.read().decode('utf-8')
       operation = json.loads(resp_body)
-      _wait_for_operation(operation)
-      return
+      return _wait_for_operation(operation)
   except urllib.error.HTTPError as e:
     resp_body = e.read().decode('utf-8') if e else ""
     try:
@@ -493,6 +494,18 @@ def purge_queue_in_cloud_tasks(queue_name):
     raise e
 
 
+def _map_rest_code_to_tq_code(code):
+  if code in [5, 404]:
+    return 14  # UNKNOWN_TASK
+  if code in [3, 400]:
+    return 5   # INVALID_TASK_NAME
+  if code in [6, 409]:
+    return 10  # TASK_ALREADY_EXISTS
+  if code in [7, 403]:
+    return 9   # PERMISSION_DENIED
+  return 3     # INTERNAL_ERROR
+
+
 def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
   """Deletes tasks from a queue using Cloud Tasks API (supporting BatchDeleteTasks)."""
   client = tasks_v2beta3.CloudTasksClient()
@@ -529,34 +542,33 @@ def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
     ]
 
     try:
-      _execute_rest_batch_delete(project, region, queue_name, task_names)
-      print(
-          f"Jetski: Successfully executed REST BatchDeleteTasks for chunk",
-          flush=True,
-      )
+      op_status = _execute_rest_batch_delete(project, region, queue_name, task_names)
+      metadata = op_status.get('metadata', {})
+      failed_requests = metadata.get('failedRequests', metadata.get('failed_requests', {}))
 
-      # Mark all as deleted
-      for t in batch:
-        t._Task__deleted = True
-        print(
-            f"Jetski: Successfully deleted task {t.name} using Cloud Tasks"
-            " BatchDelete",
-            flush=True,
-        )
+      from google.appengine.api.taskqueue.taskqueue import _TranslateError
 
-    except google_exceptions.NotFound:
-      print(
-          "Jetski: BatchDelete failed with NotFound, falling back to"
-          " individual deletes to map success/fail",
-          flush=True,
-      )
-      for t in batch:
-        name = client.task_path(project, region, queue_name, t.name)
-        try:
-          client.delete_task(request={'name': name})
+      exception = None
+      for idx, t in enumerate(batch):
+        error_status = failed_requests.get(str(idx))
+        if error_status:
+          code = error_status.get('code')
+          tq_code = _map_rest_code_to_tq_code(code)
+          if tq_code in [14, 11]:  # UNKNOWN_TASK, TOMBSTONED_TASK
+            t._Task__deleted = False
+          elif exception is None:
+            exception = _TranslateError(tq_code)
+        else:
           t._Task__deleted = True
-        except google_exceptions.NotFound:
-          t._Task__deleted = False
+          print(
+              f"Jetski: Successfully deleted task {t.name} using Cloud Tasks"
+              " BatchDelete",
+              flush=True,
+          )
+
+      if exception is not None:
+        raise exception
+
     except Exception as e:
       raise e
 
