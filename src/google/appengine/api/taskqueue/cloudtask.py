@@ -104,7 +104,8 @@ def _build_retry_config(retry_options):
 def _build_ct_task_payload(queue_name, task, client, project, region):
   """Builds the Cloud Tasks Task proto payload from GAE Task."""
   default_hostname = app_identity.get_default_version_hostname()
-  target_service = task.target or os.environ.get('GAE_SERVICE')
+  target_val = task.target if isinstance(task.target, str) else None
+  target_service = target_val or os.environ.get('GAE_SERVICE')
 
   # Workaround for SDK bug that extracts service name with trailing '-dot'
   if target_service and target_service.endswith('-dot'):
