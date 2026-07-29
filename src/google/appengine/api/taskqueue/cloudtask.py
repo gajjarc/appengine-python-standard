@@ -47,26 +47,23 @@ class _DummyRPC(object):
 
 def _get_region():
   """Determines the App Engine region."""
-  region = os.environ.get('GAE_REGION')
+  region = os.environ.get('LOCATION_ID') or os.environ.get('GAE_LOCATION') or os.environ.get('GAE_REGION')
   if region:
     return region
 
   try:
     req = urllib.request.Request(
-        'http://metadata.google.internal/computeMetadata/v1/instance/zone',
+        'http://metadata.google.internal/computeMetadata/v1/instance/region',
         headers={'Metadata-Flavor': 'Google'}
     )
-    with urllib.request.urlopen(req, timeout=1) as response:
-      zone = response.read().decode('utf-8')
-      if '/' in zone:
-        zone = zone.split('/')[-1]
-      region = zone.rsplit('-', 1)[0]
-      return region
+    with urllib.request.urlopen(req, timeout=2) as response:
+      region_path = response.read().decode('utf-8')
+      return region_path.split('/')[-1]
   except Exception:
     pass
 
   # Fallback to us-central1 if we can't detect it
-  return 'us-central1'
+  return os.environ.get('LOCAL_GCP_REGION', 'us-central1')
 
 
 def _to_duration(seconds):
