@@ -241,132 +241,8 @@ def _convert_to_rest_payload(ct_task):
   return rest_task
 
 
-def _wait_for_operation(operation_json):
-  """Polls a REST Operation until it completes."""
-  import time
-
-  op_name = operation_json.get('name')
-  if not op_name:
-    return operation_json
-
-  if operation_json.get('done', False):
-    return operation_json
-
-  url = f"https://cloudtasks.googleapis.com/v2beta3/{op_name}"
-
-  while True:
-    headers = _get_auth_headers()
-    req = urllib.request.Request(url, headers=headers, method='GET')
-    try:
-      with urllib.request.urlopen(req) as response:
-        resp_body = response.read().decode('utf-8')
-        op_status = json.loads(resp_body)
-        if op_status.get('done', False):
-          if 'error' in op_status:
-            err = op_status['error']
-            code = err.get('code', 500)
-            if code != 10:
-              raise google_exceptions.from_http_status(
-                  code, err.get('message', 'Operation failed')
-              )
-          return op_status
-    except urllib.error.HTTPError as e:
-      resp_body = e.read().decode('utf-8') if e else ""
-      try:
-        error_json = json.loads(resp_body)
-        error_msg = error_json.get('error', {}).get('message', str(e))
-        error_code = error_json.get('error', {}).get('code', e.code)
-      except:
-        error_msg = resp_body or str(e)
-        error_code = e.code
-      raise google_exceptions.from_http_status(error_code, error_msg)
-
-    time.sleep(1)
-
-
-def _execute_rest_batch_create(project, region, queue_name, tasks_payload):
-  """Calls the BatchCreateTasks REST API."""
-  url = f"https://cloudtasks.googleapis.com/v2beta3/projects/{project}/locations/{region}/queues/{queue_name}/tasks:batchCreate"
-
-  headers = _get_auth_headers()
-  payload = {"requests": tasks_payload}
-
-  data = json.dumps(payload).encode('utf-8')
-  req = urllib.request.Request(url, data=data, headers=headers, method='POST')
-
-  try:
-    with urllib.request.urlopen(req) as response:
-      resp_body = response.read().decode('utf-8')
-      return json.loads(resp_body)
-  except urllib.error.HTTPError as e:
-    resp_body = e.read().decode('utf-8') if e else ""
-    try:
-      error_json = json.loads(resp_body)
-      error_msg = error_json.get('error', {}).get('message', str(e))
-      error_code = error_json.get('error', {}).get('code', e.code)
-    except:
-      error_msg = resp_body or str(e)
-      error_code = e.code
-
-    raise google_exceptions.from_http_status(error_code, error_msg)
-
-
-def _execute_rest_batch_delete(project, region, queue_name, task_names):
-  """Calls the BatchDeleteTasks REST API and waits for completion."""
-  url = f"https://cloudtasks.googleapis.com/v2beta3/projects/{project}/locations/{region}/queues/{queue_name}/tasks:batchDelete"
-
-  headers = _get_auth_headers()
-  payload = {"names": task_names}
-
-  data = json.dumps(payload).encode('utf-8')
-  req = urllib.request.Request(url, data=data, headers=headers, method='POST')
-
-  try:
-    with urllib.request.urlopen(req) as response:
-      resp_body = response.read().decode('utf-8')
-      operation = json.loads(resp_body)
-      return _wait_for_operation(operation)
-  except urllib.error.HTTPError as e:
-    resp_body = e.read().decode('utf-8') if e else ""
-    try:
-      error_json = json.loads(resp_body)
-      error_msg = error_json.get('error', {}).get('message', str(e))
-      error_code = error_json.get('error', {}).get('code', e.code)
-    except:
-      error_msg = resp_body or str(e)
-      error_code = e.code
-    raise google_exceptions.from_http_status(error_code, error_msg)
-
-
-def _execute_rest_create_task(project, region, queue_name, task_payload):
-  """Calls the CreateTask REST API."""
-  url = f"https://cloudtasks.googleapis.com/v2beta3/projects/{project}/locations/{region}/queues/{queue_name}/tasks"
-
-  headers = _get_auth_headers()
-  payload = {"task": task_payload}
-
-  data = json.dumps(payload).encode('utf-8')
-  req = urllib.request.Request(url, data=data, headers=headers, method='POST')
-
-  try:
-    with urllib.request.urlopen(req) as response:
-      resp_body = response.read().decode('utf-8')
-      return json.loads(resp_body)
-  except urllib.error.HTTPError as e:
-    resp_body = e.read().decode('utf-8') if e else ""
-    try:
-      error_json = json.loads(resp_body)
-      error_msg = error_json.get('error', {}).get('message', str(e))
-      error_code = error_json.get('error', {}).get('code', e.code)
-    except:
-      error_msg = resp_body or str(e)
-      error_code = e.code
-
-    raise google_exceptions.from_http_status(error_code, error_msg)
-
-
 def _create_single_task_in_cloud_tasks(queue_name, task, multiple):
-  """Helper to create a single task using CreateTask API."""
+  """Helper to create a single task using CloudTasksClient CreateTask API."""
   client = tasks_v2beta3.CloudTasksClient()
   project = os.environ.get('GOOGLE_CLOUD_PROJECT')
   if project and (project.startswith('s~') or project.startswith('e~')):
@@ -375,11 +251,10 @@ def _create_single_task_in_cloud_tasks(queue_name, task, multiple):
 
   parent = client.queue_path(project, region, queue_name)
   ct_task = _build_ct_task_payload(queue_name, task, client, project, region)
-  rest_task = _convert_to_rest_payload(ct_task)
 
   try:
-    response = _execute_rest_create_task(project, region, queue_name, rest_task)
-    task_id = response['name'].split('/')[-1]
+    response_task = client.create_task(request={'parent': parent, 'task': ct_task})
+    task_id = response_task.name.split('/')[-1]
     task._Task__name = task_id
     task._Task__queue_name = queue_name
     task._Task__enqueued = True
