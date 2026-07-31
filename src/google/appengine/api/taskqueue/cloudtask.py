@@ -403,7 +403,7 @@ def _create_single_task_in_cloud_tasks(queue_name, task, multiple):
 
 
 def _create_batch_tasks_in_cloud_tasks(queue_name, tasks, multiple):
-  """Helper to create tasks in batches of up to 100 using BatchCreateTasks API."""
+  """Helper to create tasks in batches of up to 100 using CloudTasksClient BatchCreateTasks API."""
   client = tasks_v2beta3.CloudTasksClient()
   project = os.environ.get('GOOGLE_CLOUD_PROJECT')
   if project and (project.startswith('s~') or project.startswith('e~')):
@@ -432,15 +432,15 @@ def _create_batch_tasks_in_cloud_tasks(queue_name, tasks, multiple):
       ct_task_payload = _build_ct_task_payload(
           queue_name, t, client, project, region
       )
-      rest_task_payload = _convert_to_rest_payload(ct_task_payload)
-      requests_payload.append({'parent': parent, 'task': rest_task_payload})
+      requests_payload.append({'parent': parent, 'task': ct_task_payload})
 
     try:
-      response = _execute_rest_batch_create(
-          project, region, queue_name, requests_payload
+      op = client.batch_create_tasks(
+          request={'parent': parent, 'requests': requests_payload}
       )
-      for t, res_task in zip(batch, response.get('tasks', [])):
-        task_id = res_task['name'].split('/')[-1]
+      response_tasks = op.response.tasks if hasattr(op, 'response') and hasattr(op.response, 'tasks') else getattr(op, 'tasks', [])
+      for t, res_task in zip(batch, response_tasks):
+        task_id = res_task.name.split('/')[-1] if hasattr(res_task, 'name') else res_task['name'].split('/')[-1]
         t._Task__name = task_id
         t._Task__queue_name = queue_name
         t._Task__enqueued = True
@@ -505,7 +505,7 @@ def _map_rest_code_to_tq_code(code):
 
 
 def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
-  """Deletes tasks from a queue using Cloud Tasks API (supporting BatchDeleteTasks)."""
+  """Deletes tasks from a queue using Cloud Tasks Client SDK (supporting BatchDeleteTasks)."""
   client = tasks_v2beta3.CloudTasksClient()
   project = os.environ.get('GOOGLE_CLOUD_PROJECT')
   if project and (project.startswith('s~') or project.startswith('e~')):
@@ -540,17 +540,19 @@ def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
     ]
 
     try:
-      op_status = _execute_rest_batch_delete(project, region, queue_name, task_names)
-      metadata = op_status.get('metadata', {})
-      failed_requests = metadata.get('failedRequests', metadata.get('failed_requests', {}))
+      op = client.batch_delete_tasks(
+          request={'parent': parent, 'names': task_names}
+      )
+      metadata = getattr(op, 'metadata', {})
+      failed_requests = getattr(metadata, 'failed_requests', getattr(metadata, 'failedRequests', {}))
 
       from google.appengine.api.taskqueue.taskqueue import _TranslateError
 
       exception = None
       for idx, t in enumerate(batch):
-        error_status = failed_requests.get(str(idx))
+        error_status = failed_requests.get(idx) or failed_requests.get(str(idx))
         if error_status:
-          code = error_status.get('code')
+          code = getattr(error_status, 'code', None)
           tq_code = _map_rest_code_to_tq_code(code)
           if tq_code in [14, 11]:  # UNKNOWN_TASK, TOMBSTONED_TASK
             t._Task__deleted = False
@@ -559,8 +561,7 @@ def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
         else:
           t._Task__deleted = True
           print(
-              f"Jetski: Successfully deleted task {t.name} using Cloud Tasks"
-              " BatchDelete",
+              f"Jetski: Successfully deleted task {t.name} using Cloud Tasks Client SDK BatchDelete",
               flush=True,
           )
 
