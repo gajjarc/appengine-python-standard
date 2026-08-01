@@ -308,39 +308,16 @@ def _create_batch_tasks_in_cloud_tasks(queue_name, tasks, multiple):
       requests_payload.append({'parent': parent, 'task': ct_task_payload})
 
     try:
-      if hasattr(client, 'batch_create_tasks'):
-        op = client.batch_create_tasks(
-            request={'parent': parent, 'requests': requests_payload}
-        )
-        response_tasks = op.response.tasks if hasattr(op, 'response') and hasattr(op.response, 'tasks') else getattr(op, 'tasks', [])
-        for t, res_task in zip(batch, response_tasks):
-          task_id = res_task.name.split('/')[-1] if hasattr(res_task, 'name') else res_task['name'].split('/')[-1]
-          t._Task__name = task_id
-          t._Task__queue_name = queue_name
-          t._Task__enqueued = True
-          created_tasks.append(t)
-      else:
-        rest_requests = []
-        for t, ct_payload in zip(batch, requests_payload):
-          rest_requests.append({'parent': parent, 'task': _convert_to_rest_payload(ct_payload['task'])})
-        url = f"https://cloudtasks.googleapis.com/v2beta3/{parent}/tasks:batchCreate"
-        resp = requests.post(url, json={'requests': rest_requests}, headers=_get_auth_headers(), timeout=10)
-        if resp.status_code in [200, 201]:
-          res_data = resp.json()
-          for t, req in zip(batch, rest_requests):
-            t_name = req['task']['name'].split('/')[-1]
-            t._Task__name = t_name
-            t._Task__queue_name = queue_name
-            t._Task__enqueued = True
-            created_tasks.append(t)
-        elif resp.status_code == 409 or 'ALREADY_EXISTS' in resp.text:
-          from google.appengine.api.taskqueue.taskqueue import TaskAlreadyExistsError
-          raise TaskAlreadyExistsError(resp.text)
-        elif resp.status_code == 404:
-          from google.appengine.api.taskqueue.taskqueue import UnknownQueueError
-          raise UnknownQueueError(resp.text)
-        else:
-          raise Exception(f"batchCreate REST API error ({resp.status_code}): {resp.text}")
+      op = client.batch_create_tasks(
+          request={'parent': parent, 'requests': requests_payload}
+      )
+      response_tasks = op.response.tasks if hasattr(op, 'response') and hasattr(op.response, 'tasks') else getattr(op, 'tasks', [])
+      for t, res_task in zip(batch, response_tasks):
+        task_id = res_task.name.split('/')[-1] if hasattr(res_task, 'name') else res_task['name'].split('/')[-1]
+        t._Task__name = task_id
+        t._Task__queue_name = queue_name
+        t._Task__enqueued = True
+        created_tasks.append(t)
     except (google_exceptions.AlreadyExists, google_exceptions.Conflict) as e:
       from google.appengine.api.taskqueue.taskqueue import TaskAlreadyExistsError
       raise TaskAlreadyExistsError(str(e))
@@ -436,52 +413,29 @@ def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
     ]
 
     try:
-      if hasattr(client, 'batch_delete_tasks'):
-        op = client.batch_delete_tasks(
-            request={'parent': parent, 'names': task_names}
-        )
-        metadata = getattr(op, 'metadata', {})
-        failed_requests = getattr(metadata, 'failed_requests', getattr(metadata, 'failedRequests', {}))
+      op = client.batch_delete_tasks(
+          request={'parent': parent, 'names': task_names}
+      )
+      metadata = getattr(op, 'metadata', {})
+      failed_requests = getattr(metadata, 'failed_requests', getattr(metadata, 'failedRequests', {}))
 
-        from google.appengine.api.taskqueue.taskqueue import _TranslateError
+      from google.appengine.api.taskqueue.taskqueue import _TranslateError
 
-        exception = None
-        for idx, t in enumerate(batch):
-          error_status = failed_requests.get(idx) or failed_requests.get(str(idx))
-          if error_status:
-            code = getattr(error_status, 'code', None)
-            tq_code = _map_rest_code_to_tq_code(code)
-            if tq_code in [14, 11]:
-              t._Task__deleted = False
-            elif exception is None:
-              exception = _TranslateError(tq_code)
-          else:
-            t._Task__deleted = True
-        if exception is not None:
-          raise exception
-      else:
-        url = f"https://cloudtasks.googleapis.com/v2beta3/{parent}/tasks:batchDelete"
-        resp = requests.post(url, json={'names': task_names}, headers=_get_auth_headers(), timeout=10)
-        if resp.status_code in [200, 202]:
-          res_data = resp.json() if resp.text else {}
-          failed_requests = res_data.get('metadata', {}).get('failedRequests', res_data.get('metadata', {}).get('failed_requests', {}))
-          from google.appengine.api.taskqueue.taskqueue import _TranslateError
-          exception = None
-          for idx, t in enumerate(batch):
-            error_status = failed_requests.get(idx) or failed_requests.get(str(idx))
-            if error_status:
-              code = error_status.get('code')
-              tq_code = _map_rest_code_to_tq_code(code)
-              if tq_code in [14, 11]:
-                t._Task__deleted = False
-              elif exception is None:
-                exception = _TranslateError(tq_code)
-            else:
-              t._Task__deleted = True
-          if exception is not None:
-            raise exception
+      exception = None
+      for idx, t in enumerate(batch):
+        error_status = failed_requests.get(idx) or failed_requests.get(str(idx))
+        if error_status:
+          code = getattr(error_status, 'code', None)
+          tq_code = _map_rest_code_to_tq_code(code)
+          if tq_code in [14, 11]:
+            t._Task__deleted = False
+          elif exception is None:
+            exception = _TranslateError(tq_code)
         else:
-          raise Exception(f"batchDelete REST API error ({resp.status_code}): {resp.text}")
+          t._Task__deleted = True
+
+      if exception is not None:
+        raise exception
     except Exception as e:
       raise e
 
