@@ -167,8 +167,10 @@ def _build_ct_task_payload(queue_name, task, client, project, region):
     timestamp = Timestamp(seconds=seconds, nanos=nanos)
     ct_task['schedule_time'] = timestamp
 
-  if task.retry_options and hasattr(task.retry_options, 'task_retry_limit'):
-    pass
+  if task.retry_options:
+    retry_config = _build_retry_config(task.retry_options)
+    if retry_config:
+      ct_task['retry_config'] = retry_config
 
   return ct_task
 
