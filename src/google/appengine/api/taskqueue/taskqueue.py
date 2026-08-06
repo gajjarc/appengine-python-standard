@@ -1656,7 +1656,7 @@ class Queue(object):
       Error-subclass on application errors.
     """
     import os
-    if os.environ.get('GAE_PUSHQUEUE_BACKEND') == 'CLOUD_TASK' and 'pull' not in self.__name.lower():
+    if str(os.environ.get('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE', '')).lower() == 'true' and 'pull' not in self.__name.lower():
       from google.appengine.api.taskqueue import cloudtask
       cloudtask.purge_queue_in_cloud_tasks(self.__name)
       return
@@ -1797,7 +1797,7 @@ class Queue(object):
   def __DeleteTasks(self, tasks, multiple, rpc=None):
     """Internal implementation of delete_tasks_async(), tasks must be a list."""
     import os
-    if (os.environ.get('GAE_PUSHQUEUE_BACKEND') == 'CLOUD_TASK'
+    if (str(os.environ.get('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE', '')).lower() == 'true'
         and 'pull' not in self.__name.lower()
         and not any(getattr(t, 'method', None) == 'PULL' for t in tasks)):
       from google.appengine.api.taskqueue import cloudtask
@@ -2149,11 +2149,12 @@ class Queue(object):
 
     # Intercept for Cloud Tasks backend
     import os
-    if (os.environ.get('GAE_PUSHQUEUE_BACKEND') == 'CLOUD_TASK'
+    if (str(os.environ.get('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE', '')).lower() == 'true'
         and has_push_task
         and len(tasks) >= 1):
       if transactional:
-        cloudtask.add_transactional_tasks(self.__name, tasks, multiple)
+        from google.appengine.api.taskqueue import cloudtask_transactional
+        cloudtask_transactional.add_transactional_tasks(self.__name, tasks, multiple)
         return cloudtask._DummyRPC(lambda: tasks if multiple else tasks[0])
       else:
         result = cloudtask.create_tasks_in_cloud_tasks(self.__name, tasks, multiple)

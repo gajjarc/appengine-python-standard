@@ -393,8 +393,8 @@ def CloudTaskSweepMiddleware(app, wsgi_env, start_response):
   """
   path = wsgi_env['PATH_INFO']
   if path == '/_ah/cloudtask/sweep':
-    from google.appengine.api.taskqueue import cloudtask
-    return cloudtask.sweep_wsgi_app(wsgi_env, start_response)
+    from google.appengine.api.taskqueue import cloudtask_transactional
+    return cloudtask_transactional.sweep_wsgi_app(wsgi_env, start_response)
   return app(wsgi_env, start_response)
 
 
