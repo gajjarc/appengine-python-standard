@@ -47,6 +47,8 @@ from google.appengine.api import urlfetch
 from google.appengine.api.taskqueue import taskqueue_service_bytes_pb2 as taskqueue_service_pb2
 from google.appengine.runtime import apiproxy_errors
 from google.appengine.api.taskqueue import cloudtask
+if str(os.environ.get('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE', '')).lower() == 'true':
+  from google.appengine.api.taskqueue import cloudtask_transactional
 from google.appengine.runtime import context
 import six
 from six.moves import urllib
