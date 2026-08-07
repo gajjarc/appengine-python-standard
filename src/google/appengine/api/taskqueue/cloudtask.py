@@ -447,4 +447,56 @@ def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
     return tasks[0]
 
 
+def fetch_queue_stats_in_cloud_tasks(queues, multiple):
+  """Fetches queue statistics for given queues using Cloud Tasks API."""
+  from google.appengine.api.taskqueue.taskqueue import QueueStatistics, UnknownQueueError
+  from google.protobuf import field_mask_pb2
+
+  client = tasks_v2beta3.CloudTasksClient()
+  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  if project and (project.startswith('s~') or project.startswith('e~')):
+    project = project[2:]
+  region = _get_region()
+
+  queue_stats_list = []
+  read_mask = field_mask_pb2.FieldMask(paths=['stats'])
+
+  for queue in queues:
+    queue_name = queue.name if hasattr(queue, 'name') else str(queue)
+    name = client.queue_path(project, region, queue_name)
+    try:
+      q_resp = client.get_queue(request={'name': name, 'read_mask': read_mask})
+      ct_stats = getattr(q_resp, 'stats', None)
+
+      tasks = getattr(ct_stats, 'tasks_count', 0) if ct_stats else 0
+      oldest_eta_usec = None
+      if ct_stats and getattr(ct_stats, 'oldest_estimated_arrival_time', None):
+        oldest_eta = ct_stats.oldest_estimated_arrival_time
+        oldest_eta_usec = int(oldest_eta.timestamp() * 1e6)
+
+      executed_last_minute = getattr(ct_stats, 'executed_last_minute_count', 0) if ct_stats else 0
+      in_flight = getattr(ct_stats, 'concurrent_dispatches_count', 0) if ct_stats else 0
+      enforced_rate = getattr(ct_stats, 'effective_execution_rate', 0.0) if ct_stats else 0.0
+
+      qs = QueueStatistics(
+          queue=queue,
+          tasks=tasks,
+          oldest_eta_usec=oldest_eta_usec,
+          executed_last_minute=executed_last_minute,
+          in_flight=in_flight,
+          enforced_rate=enforced_rate,
+      )
+      queue_stats_list.append(qs)
+    except google_exceptions.NotFound as e:
+      raise UnknownQueueError(str(e))
+    except Exception as e:
+      raise e
+
+  if multiple:
+    return queue_stats_list
+  else:
+    return queue_stats_list[0]
+
+
+
 

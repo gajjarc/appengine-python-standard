@@ -1567,6 +1567,10 @@ class QueueStatistics(object):
   @classmethod
   def _FetchMultipleQueues(cls, queues, multiple, rpc=None):
     """Internal implementation of fetch stats where queues must be a list."""
+    if str(os.environ.get('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE', '')).lower() == 'true':
+      from google.appengine.api.taskqueue import cloudtask
+      result = cloudtask.fetch_queue_stats_in_cloud_tasks(queues, multiple)
+      return cloudtask._DummyRPC(lambda: result)
 
     def ResultHook(rpc):
       """Processes the TaskQueueFetchQueueStatsResponse."""
