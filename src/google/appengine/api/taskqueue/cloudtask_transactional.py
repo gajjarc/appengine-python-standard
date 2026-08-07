@@ -20,7 +20,6 @@ import datetime
 import json
 import logging
 import os
-import threading
 import uuid
 
 from google.api_core import exceptions as google_exceptions
@@ -216,22 +215,6 @@ def sweep_wsgi_app(environ, start_response):
 # Private Helpers
 # ==============================================================================
 
-_transaction_pending_keys = threading.local()
-
-
-def _get_tx_pending():
-  return getattr(_transaction_pending_keys, 'keys', None)
-
-
-def _start_tx_context():
-  prev = getattr(_transaction_pending_keys, 'keys', None)
-  _transaction_pending_keys.keys = []
-  return prev
-
-
-def _restore_tx_context(prev):
-  _transaction_pending_keys.keys = prev
-
 
 @contextlib.contextmanager
 def _use_default_datastore_adapter():
@@ -314,10 +297,15 @@ def _register_post_commit_dispatch(queue_name, pending_keys):
     )
     return
 
-  tx_pending = _get_tx_pending()
-  if tx_pending is not None:
-    tx_pending.extend(pending_keys)
-  else:
-    raise taskqueue.BadTransactionStateError(
-        'Transactional tasks must be added inside a transaction.'
+  if datastore.IsInTransaction():
+    conn = datastore._GetConnection()
+    if not hasattr(conn, '_on_commit_callbacks'):
+      conn._on_commit_callbacks = []
+    conn._on_commit_callbacks.append(
+        lambda: _dispatch_pending_keys_now(pending_keys)
     )
+    return
+
+  raise taskqueue.BadTransactionStateError(
+      'Transactional tasks must be added inside a transaction.'
+  )
