@@ -23,7 +23,10 @@ import urllib.error
 import urllib.request
 from google.api_core import exceptions as google_exceptions
 from google.appengine.api import app_identity
+from google.appengine.api.taskqueue import taskqueue
 from google.cloud import tasks_v2beta3
+from google.protobuf import duration_pb2
+from google.protobuf import field_mask_pb2
 from google.protobuf.timestamp_pb2 import Timestamp
 
 # Environment variable constants
@@ -109,8 +112,7 @@ def _get_region():
 def _to_duration(seconds):
   if seconds is None:
     return None
-  from google.protobuf.duration_pb2 import Duration
-  duration = Duration()
+  duration = duration_pb2.Duration()
   duration.seconds = int(seconds)
   duration.nanos = int((seconds - duration.seconds) * 1e9)
   return duration
@@ -246,15 +248,12 @@ def _create_single_task_in_cloud_tasks(queue_name, task, multiple):
     else:
       return task
   except (google_exceptions.AlreadyExists, google_exceptions.Conflict) as e:
-    from google.appengine.api.taskqueue.taskqueue import TaskAlreadyExistsError
-    raise TaskAlreadyExistsError(str(e))
+    raise taskqueue.TaskAlreadyExistsError(str(e))
   except google_exceptions.NotFound as e:
-    from google.appengine.api.taskqueue.taskqueue import UnknownQueueError
-    raise UnknownQueueError(str(e))
+    raise taskqueue.UnknownQueueError(str(e))
   except google_exceptions.BadRequest as e:
     if 'Queue does not exist' in str(e):
-      from google.appengine.api.taskqueue.taskqueue import UnknownQueueError
-      raise UnknownQueueError(str(e))
+      raise taskqueue.UnknownQueueError(str(e))
     raise e
   except Exception as e:
     raise e
@@ -273,13 +272,10 @@ def _create_batch_tasks_in_cloud_tasks(queue_name, tasks, multiple):
   for task in tasks:
     if task.name:
       if task.name in task_names:
-        from google.appengine.api.taskqueue.taskqueue import DuplicateTaskNameError
-        raise DuplicateTaskNameError(
+        raise taskqueue.DuplicateTaskNameError(
             'The task name %s is duplicated' % task.name
         )
       task_names.add(task.name)
-
-  from google.appengine.api.taskqueue.taskqueue import _TranslateError, TaskAlreadyExistsError, TombstonedTaskError
 
   created_tasks = []
   for i in range(0, len(tasks), _BATCH_CREATE_TASKS_MAX_SIZE):
@@ -308,8 +304,8 @@ def _create_batch_tasks_in_cloud_tasks(queue_name, tasks, multiple):
         if error_status:
           code = getattr(error_status, 'code', None)
           tq_code = _map_rest_code_to_tq_code(code)
-          if exception is None or isinstance(exception, TaskAlreadyExistsError) or isinstance(exception, TombstonedTaskError):
-            exception = _TranslateError(tq_code)
+          if exception is None or isinstance(exception, taskqueue.TaskAlreadyExistsError) or isinstance(exception, taskqueue.TombstonedTaskError):
+            exception = taskqueue._TranslateError(tq_code)
         else:
           try:
             res_task = next(res_iter)
@@ -381,16 +377,13 @@ def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
   task_names_set = set()
   for task in tasks:
     if not task.name:
-      from google.appengine.api.taskqueue.taskqueue import BadTaskStateError
-      raise BadTaskStateError('A task name must be specified for a task')
+      raise taskqueue.BadTaskStateError('A task name must be specified for a task')
     if task.was_deleted:
-      from google.appengine.api.taskqueue.taskqueue import BadTaskStateError
-      raise BadTaskStateError(
+      raise taskqueue.BadTaskStateError(
           'The task %s has already been deleted' % task.name
       )
     if task.name in task_names_set:
-      from google.appengine.api.taskqueue.taskqueue import DuplicateTaskNameError
-      raise DuplicateTaskNameError(
+      raise taskqueue.DuplicateTaskNameError(
           'The task name %s is duplicated' % task.name
       )
     task_names_set.add(task.name)
@@ -408,8 +401,6 @@ def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
       metadata = getattr(op, 'metadata', {})
       failed_requests = getattr(metadata, 'failed_requests', getattr(metadata, 'failedRequests', {}))
 
-      from google.appengine.api.taskqueue.taskqueue import _TranslateError
-
       exception = None
       for idx, t in enumerate(batch):
         error_status = failed_requests.get(idx) or failed_requests.get(str(idx))
@@ -419,7 +410,7 @@ def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
           if tq_code in [14, 11]:
             t._Task__deleted = False
           elif exception is None:
-            exception = _TranslateError(tq_code)
+            exception = taskqueue._TranslateError(tq_code)
         else:
           t._Task__deleted = True
 
@@ -436,9 +427,6 @@ def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
 
 def fetch_queue_stats_in_cloud_tasks(queues, multiple):
   """Fetches queue statistics for given queues using Cloud Tasks API."""
-  from google.appengine.api.taskqueue.taskqueue import QueueStatistics, UnknownQueueError
-  from google.protobuf import field_mask_pb2
-
   client = tasks_v2beta3.CloudTasksClient()
   project = _get_project_id()
   region = _get_region()
@@ -463,7 +451,7 @@ def fetch_queue_stats_in_cloud_tasks(queues, multiple):
       in_flight = getattr(ct_stats, 'concurrent_dispatches_count', 0) if ct_stats else 0
       enforced_rate = getattr(ct_stats, 'effective_execution_rate', 0.0) if ct_stats else 0.0
 
-      qs = QueueStatistics(
+      qs = taskqueue.QueueStatistics(
           queue=queue,
           tasks=tasks,
           oldest_eta_usec=oldest_eta_usec,
@@ -473,7 +461,7 @@ def fetch_queue_stats_in_cloud_tasks(queues, multiple):
       )
       queue_stats_list.append(qs)
     except google_exceptions.NotFound as e:
-      raise UnknownQueueError(f'Queue {queue_name} not found: {e}')
+      raise taskqueue.UnknownQueueError(f'Queue {queue_name} not found: {e}')
     except Exception as e:
       raise e
 

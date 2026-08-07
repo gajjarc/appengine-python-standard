@@ -47,10 +47,7 @@ from google.appengine.api import urlfetch
 from google.appengine.api.taskqueue import taskqueue_service_bytes_pb2 as taskqueue_service_pb2
 from google.appengine.runtime import apiproxy_errors
 from google.appengine.api.taskqueue import cloudtask
-if str(os.environ.get(cloudtask.ENV_USE_CLOUDTASK_PUSH_QUEUE, '')).lower() == 'true':
-  from google.appengine.api.taskqueue import cloudtask_transactional
-else:
-  cloudtask_transactional = None
+from google.appengine.api.taskqueue import cloudtask_transactional
 from google.appengine.runtime import context
 import six
 from six.moves import urllib
@@ -2151,11 +2148,7 @@ class Queue(object):
         and has_push_task
         and len(tasks) >= 1):
       if transactional:
-        if cloudtask_transactional:
-          cloudtask_transactional.add_transactional_tasks(self.__name, tasks, multiple)
-        else:
-          from google.appengine.api.taskqueue import cloudtask_transactional as ct_tx
-          ct_tx.add_transactional_tasks(self.__name, tasks, multiple)
+        cloudtask_transactional.add_transactional_tasks(self.__name, tasks, multiple)
         return cloudtask._CloudTaskRPC(lambda: tasks if multiple else tasks[0])
       else:
         return cloudtask._CloudTaskRPC(lambda: cloudtask.create_tasks_in_cloud_tasks(self.__name, tasks, multiple))

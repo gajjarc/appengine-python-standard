@@ -21,11 +21,19 @@ import json
 import logging
 import os
 import threading
+import uuid
 
 from google.api_core import exceptions as google_exceptions
 from google.appengine.api import datastore
 from google.appengine.api.taskqueue import cloudtask
+from google.appengine.api.taskqueue import taskqueue
 from google.cloud import tasks_v2beta3
+from google.protobuf.timestamp_pb2 import Timestamp
+
+try:
+  from google.appengine.ext import ndb
+except ImportError:
+  ndb = None
 
 _SWEEPER_MAX_RETRIES = 5
 _SWEEPER_LOCK_TIMEOUT_SECONDS = 60
@@ -57,7 +65,6 @@ def dispatch_task_payload(queue_name, task_payload):
     task_payload['app_engine_http_request'] = ae_req
 
   if 'schedule_time' in task_payload and isinstance(task_payload['schedule_time'], dict):
-    from google.protobuf.timestamp_pb2 import Timestamp
     st = task_payload['schedule_time']
     task_payload['schedule_time'] = Timestamp(seconds=st.get('seconds', 0), nanos=st.get('nanos', 0))
 
@@ -156,45 +163,31 @@ def _dispatch_pending_keys_now(pending_keys, handled_by_sweeper=False):
 
 
 def _register_post_commit_dispatch(queue_name, pending_keys):
-  try:
-    from google.appengine.ext import ndb
-
-    if ndb.in_transaction():
-      ndb.get_context().call_on_commit(
-          lambda: _dispatch_pending_keys_now(pending_keys)
-      )
-      return
-  except ImportError:
-    pass
+  if ndb and ndb.in_transaction():
+    ndb.get_context().call_on_commit(
+        lambda: _dispatch_pending_keys_now(pending_keys)
+    )
+    return
 
   tx_pending = _get_tx_pending()
   if tx_pending is not None:
     tx_pending.extend(pending_keys)
   else:
-    from google.appengine.api.taskqueue.taskqueue import BadTransactionStateError
-
-    raise BadTransactionStateError(
+    raise taskqueue.BadTransactionStateError(
         'Transactional tasks must be added inside a transaction.'
     )
 
 
 def add_transactional_tasks(queue_name, tasks, multiple):
   """Stages transactional tasks in Datastore within the active transaction."""
-  import uuid
-
   # Check pre-conditions (duplicate names or already queued)
-  task_names_set = set()
   for task in tasks:
     if task.name:
-      from google.appengine.api.taskqueue.taskqueue import InvalidTaskNameError
-
-      raise InvalidTaskNameError(
+      raise taskqueue.InvalidTaskNameError(
           'A task bound to a transaction cannot be named.'
       )
     if task.was_enqueued:
-      from google.appengine.api.taskqueue.taskqueue import BadTaskStateError
-
-      raise BadTaskStateError('The task has already been enqueued.')
+      raise taskqueue.BadTaskStateError('The task has already been enqueued.')
 
   pending_keys = []
   for task in tasks:
