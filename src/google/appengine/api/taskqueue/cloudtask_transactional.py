@@ -14,6 +14,7 @@
 
 """Cloud Tasks transactional task support for Taskqueue SDK."""
 
+import base64
 import contextlib
 import datetime
 import json
@@ -40,12 +41,22 @@ def build_rest_payload_for_transactional_task(queue_name, task):
 
 
 def dispatch_rest_task(queue_name, task_payload):
-  """Dispatches a pre-built REST task payload immediately."""
+  """Dispatches a pre-built task payload immediately using CloudTasksClient."""
+  client = tasks_v2beta3.CloudTasksClient()
   project = os.environ.get('GOOGLE_CLOUD_PROJECT')
   if project and (project.startswith('s~') or project.startswith('e~')):
     project = project[2:]
   region = cloudtask._get_region()
-  cloudtask._execute_rest_create_task(project, region, queue_name, task_payload)
+
+  parent = client.queue_path(project, region, queue_name)
+
+  # Unpack base64 body if encoded by _convert_to_rest_payload
+  if 'app_engine_http_request' in task_payload:
+    ae_req = task_payload['app_engine_http_request']
+    if 'body' in ae_req and isinstance(ae_req['body'], str):
+      ae_req['body'] = base64.b64decode(ae_req['body'].encode('utf-8'))
+
+  client.create_task(request={'parent': parent, 'task': task_payload})
 
 
 _transaction_pending_keys = threading.local()
