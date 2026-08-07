@@ -1568,8 +1568,7 @@ class QueueStatistics(object):
   def _FetchMultipleQueues(cls, queues, multiple, rpc=None):
     """Internal implementation of fetch stats where queues must be a list."""
     if str(os.environ.get(cloudtask.ENV_USE_CLOUDTASK_PUSH_QUEUE, '')).lower() == 'true':
-      result = cloudtask.fetch_queue_stats_in_cloud_tasks(queues, multiple)
-      return cloudtask._DummyRPC(lambda: result)
+      return cloudtask._CloudTaskRPC(lambda: cloudtask.fetch_queue_stats_in_cloud_tasks(queues, multiple))
 
     def ResultHook(rpc):
       """Processes the TaskQueueFetchQueueStatsResponse."""
@@ -1802,8 +1801,7 @@ class Queue(object):
     if (str(os.environ.get(cloudtask.ENV_USE_CLOUDTASK_PUSH_QUEUE, '')).lower() == 'true'
         and 'pull' not in self.__name.lower()
         and not any(getattr(t, 'method', None) == 'PULL' for t in tasks)):
-      result = cloudtask.delete_tasks_in_cloud_tasks(self.__name, tasks, multiple)
-      return cloudtask._DummyRPC(lambda: result)
+      return cloudtask._CloudTaskRPC(lambda: cloudtask.delete_tasks_in_cloud_tasks(self.__name, tasks, multiple))
 
     def ResultHook(rpc):
       """Processes the TaskQueueDeleteResponse."""
@@ -2158,10 +2156,9 @@ class Queue(object):
         else:
           from google.appengine.api.taskqueue import cloudtask_transactional as ct_tx
           ct_tx.add_transactional_tasks(self.__name, tasks, multiple)
-        return cloudtask._DummyRPC(lambda: tasks if multiple else tasks[0])
+        return cloudtask._CloudTaskRPC(lambda: tasks if multiple else tasks[0])
       else:
-        result = cloudtask.create_tasks_in_cloud_tasks(self.__name, tasks, multiple)
-        return cloudtask._DummyRPC(lambda: result)
+        return cloudtask._CloudTaskRPC(lambda: cloudtask.create_tasks_in_cloud_tasks(self.__name, tasks, multiple))
 
     if has_push_task:
       fill_function = self.__FillAddPushTasksRequest

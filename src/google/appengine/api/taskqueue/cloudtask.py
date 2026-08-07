@@ -36,30 +36,42 @@ ENV_GAE_SERVICE = 'GAE_SERVICE'
 ENV_GAE_VERSION = 'GAE_VERSION'
 
 
-class _DummyRPC(object):
-  """A dummy RPC object wrapping synchronous CloudTasksClient calls.
+from concurrent import futures
 
-  The legacy App Engine TaskQueue SDK provides async methods (e.g.
-  add_async, delete_tasks_async, purge_async, fetch_async) that return an
-  RPC object with a .get_result() method. Synchronous methods invoke these
-  async variants and call .get_result() on the returned RPC object.
+_MAX_CONCURRENT_API_CALLS = 100
+_THREAD_POOL = futures.ThreadPoolExecutor(_MAX_CONCURRENT_API_CALLS)
 
-  Since CloudTasksClient calls execute synchronously, _DummyRPC wraps the
-  returned value so that both synchronous callers (via get_result) and
-  asynchronous callers receive a consistent RPC interface.
+
+class _CloudTaskRPC(object):
+  """RPC object wrapping asynchronous execution via ThreadPoolExecutor.
+
+  Matches the async model of apiproxy_rpc.py using a ThreadPoolExecutor.
+  Calls are scheduled onto background threads asynchronously, allowing
+  operations to run concurrently until .get_result() or .wait() is called.
   """
 
-  def __init__(self, result_provider):
-    self._result_provider = result_provider
+  def __init__(self, future_or_callable):
+    if callable(future_or_callable):
+      self._future = _THREAD_POOL.submit(future_or_callable)
+    else:
+      self._future = future_or_callable
 
   def get_result(self):
-    return self._result_provider()
+    return self._future.result()
 
   def wait(self):
-    pass
+    self._future.result()
 
   def check_success(self):
-    pass
+    self._future.result()
+
+  @property
+  def future(self):
+    return self._future
+
+
+# Alias for backward compatibility
+_DummyRPC = _CloudTaskRPC
 
 
 def _get_region():
