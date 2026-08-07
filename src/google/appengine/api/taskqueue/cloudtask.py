@@ -17,6 +17,7 @@
 import base64
 from concurrent import futures
 import datetime
+import http
 import json
 import os
 import urllib.error
@@ -24,10 +25,12 @@ import urllib.request
 from google.api_core import exceptions as google_exceptions
 from google.appengine.api import app_identity
 from google.appengine.api.taskqueue import taskqueue
+from google.appengine.api.taskqueue import taskqueue_service_bytes_pb2 as taskqueue_service_pb2
 from google.cloud import tasks_v2beta3
 from google.protobuf import duration_pb2
 from google.protobuf import field_mask_pb2
 from google.protobuf.timestamp_pb2 import Timestamp
+from google.rpc import code_pb2
 
 # Environment variable constants
 ENV_USE_CLOUDTASK_PUSH_QUEUE = 'APPENGINE_USE_CLOUDTASK_PUSH_QUEUE'
@@ -46,6 +49,11 @@ _BATCH_DELETE_TASKS_MAX_SIZE = 1000
 _METADATA_SERVER_TIMEOUT_SECONDS = 2
 
 _THREAD_POOL = futures.ThreadPoolExecutor(_MAX_CONCURRENT_API_CALLS)
+
+
+def is_cloudtask_push_queue_enabled():
+  """Checks if Cloud Tasks backend is enabled for Push Queues."""
+  return str(os.environ.get(ENV_USE_CLOUDTASK_PUSH_QUEUE, '')).lower() == 'true'
 
 
 class _CloudTaskRPC(object):
@@ -354,15 +362,16 @@ def purge_queue_in_cloud_tasks(queue_name):
 
 
 def _map_rest_code_to_tq_code(code):
-  if code in [5, 404]:
-    return 14  # UNKNOWN_TASK
-  if code in [3, 400]:
-    return 5   # INVALID_TASK_NAME
-  if code in [6, 409]:
-    return 10  # TASK_ALREADY_EXISTS
-  if code in [7, 403]:
-    return 9   # PERMISSION_DENIED
-  return 3     # INTERNAL_ERROR
+  """Maps gRPC / HTTP error status codes to legacy TaskQueue error enum codes."""
+  if code in [code_pb2.NOT_FOUND, http.HTTPStatus.NOT_FOUND]:
+    return taskqueue_service_pb2.TaskQueueServiceError.UNKNOWN_TASK
+  if code in [code_pb2.INVALID_ARGUMENT, http.HTTPStatus.BAD_REQUEST]:
+    return taskqueue_service_pb2.TaskQueueServiceError.INVALID_TASK_NAME
+  if code in [code_pb2.ALREADY_EXISTS, http.HTTPStatus.CONFLICT]:
+    return taskqueue_service_pb2.TaskQueueServiceError.TASK_ALREADY_EXISTS
+  if code in [code_pb2.PERMISSION_DENIED, http.HTTPStatus.FORBIDDEN]:
+    return taskqueue_service_pb2.TaskQueueServiceError.PERMISSION_DENIED
+  return taskqueue_service_pb2.TaskQueueServiceError.INTERNAL_ERROR
 
 
 def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
@@ -407,7 +416,7 @@ def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
         if error_status:
           code = getattr(error_status, 'code', None)
           tq_code = _map_rest_code_to_tq_code(code)
-          if tq_code in [14, 11]:
+          if tq_code in [taskqueue_service_pb2.TaskQueueServiceError.UNKNOWN_TASK, taskqueue_service_pb2.TaskQueueServiceError.TOMBSTONED_TASK]:
             t._Task__deleted = False
           elif exception is None:
             exception = taskqueue._TranslateError(tq_code)

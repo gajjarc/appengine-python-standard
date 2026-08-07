@@ -35,6 +35,13 @@ try:
 except ImportError:
   ndb = None
 
+# Constants
+_PENDING_TASK_KIND = '_AE_PendingCloudTask'
+_TX_TASK_STATUS_PENDING = 'PENDING'
+_TX_TASK_STATUS_PROCESSING = 'PROCESSING'
+_TX_TASK_STATUS_DONE = 'DONE'
+_TX_TASK_STATUS_FAILED = 'FAILED'
+
 _SWEEPER_MAX_RETRIES = 5
 _SWEEPER_LOCK_TIMEOUT_SECONDS = 60
 _SWEEPER_FAST_PATH_GRACE_SECONDS = 60
@@ -123,7 +130,7 @@ def _dispatch_pending_keys_now(pending_keys, handled_by_sweeper=False):
     # Acquire lock on entity to prevent duplicate sweeper dispatches
     now = datetime.datetime.utcnow()
     try:
-      entity['status'] = 'PROCESSING'
+      entity['status'] = _TX_TASK_STATUS_PROCESSING
       entity['lock_expires'] = now + datetime.timedelta(seconds=_SWEEPER_LOCK_TIMEOUT_SECONDS)
       entity['handled_by_sweeper'] = handled_by_sweeper
       with _use_default_datastore_adapter():
@@ -150,10 +157,10 @@ def _dispatch_pending_keys_now(pending_keys, handled_by_sweeper=False):
       entity['retry_count'] = retry_count
       entity['last_error'] = str(e)[:500]
       if retry_count >= _SWEEPER_MAX_RETRIES:
-        entity['status'] = 'FAILED'
+        entity['status'] = _TX_TASK_STATUS_FAILED
         entity['lock_expires'] = None
       else:
-        entity['status'] = 'PENDING'
+        entity['status'] = _TX_TASK_STATUS_PENDING
         entity['lock_expires'] = None
       try:
         with _use_default_datastore_adapter():
@@ -221,11 +228,11 @@ def add_transactional_tasks(queue_name, tasks, multiple):
     if 'retry_config' in ct_task_payload:
       serializable_payload['retry_config'] = ct_task_payload['retry_config']
 
-    entity = datastore.Entity('_AE_PendingCloudTask')
+    entity = datastore.Entity(_PENDING_TASK_KIND)
     entity['task_name'] = generated_name
     entity['queue_name'] = queue_name
     entity['payload'] = json.dumps(serializable_payload)
-    entity['status'] = 'PENDING'
+    entity['status'] = _TX_TASK_STATUS_PENDING
     entity['created'] = datetime.datetime.utcnow()
     entity['retry_count'] = 0
 
@@ -246,10 +253,10 @@ def sweep():
   """Queries Datastore for pending Cloud Tasks and dispatches them."""
   try:
     with _use_default_datastore_adapter():
-      query = datastore.Query('_AE_PendingCloudTask')
+      query = datastore.Query(_PENDING_TASK_KIND)
       entities = query.Run()
   except Exception as e:
-    logging.error("Failed to query _AE_PendingCloudTask in sweeper: %s", e)
+    logging.error("Failed to query %s in sweeper: %s", _PENDING_TASK_KIND, e)
     return
 
   now = datetime.datetime.utcnow()
@@ -257,10 +264,10 @@ def sweep():
   for entity in entities:
     if not entity:
       continue
-    status = entity.get('status', 'PENDING')
-    if status == 'DONE':
+    status = entity.get('status', _TX_TASK_STATUS_PENDING)
+    if status == _TX_TASK_STATUS_DONE:
       continue
-    if status == 'PROCESSING':
+    if status == _TX_TASK_STATUS_PROCESSING:
       lock_expires = entity.get('lock_expires')
       if lock_expires and isinstance(lock_expires, datetime.datetime):
         if now < lock_expires:
@@ -269,12 +276,12 @@ def sweep():
         continue  # assume lock valid if just started
 
     created = entity.get('created')
-    if status == 'PENDING' and created and isinstance(created, datetime.datetime):
+    if status == _TX_TASK_STATUS_PENDING and created and isinstance(created, datetime.datetime):
       if (now - created).total_seconds() < _SWEEPER_FAST_PATH_GRACE_SECONDS:
         continue  # give fast-path grace period to dispatch post-commit
 
     retry_count = entity.get('retry_count', 0)
-    if status == 'FAILED' and retry_count >= _SWEEPER_MAX_RETRIES:
+    if status == _TX_TASK_STATUS_FAILED and retry_count >= _SWEEPER_MAX_RETRIES:
       continue  # exceeded max sweeper retries
 
     keys_to_dispatch.append(entity.key())

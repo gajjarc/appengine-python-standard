@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import http
 import os
 import unittest
 from unittest import mock
 from google.appengine.api.taskqueue import cloudtask
 from google.appengine.api.taskqueue import taskqueue
+from google.appengine.api.taskqueue import taskqueue_service_bytes_pb2 as taskqueue_service_pb2
+from google.rpc import code_pb2
 
 
 class CloudtaskTest(unittest.TestCase):
@@ -81,6 +84,38 @@ class CloudtaskTest(unittest.TestCase):
       self.assertEqual(cloudtask._get_project_id(), 'my-app')
     with mock.patch.dict(os.environ, {cloudtask.ENV_GOOGLE_CLOUD_PROJECT: 'my-app'}):
       self.assertEqual(cloudtask._get_project_id(), 'my-app')
+
+  def test_is_cloudtask_push_queue_enabled(self):
+    with mock.patch.dict(os.environ, {cloudtask.ENV_USE_CLOUDTASK_PUSH_QUEUE: 'true'}):
+      self.assertTrue(cloudtask.is_cloudtask_push_queue_enabled())
+    with mock.patch.dict(os.environ, {cloudtask.ENV_USE_CLOUDTASK_PUSH_QUEUE: 'True'}):
+      self.assertTrue(cloudtask.is_cloudtask_push_queue_enabled())
+    with mock.patch.dict(os.environ, {cloudtask.ENV_USE_CLOUDTASK_PUSH_QUEUE: 'false'}):
+      self.assertFalse(cloudtask.is_cloudtask_push_queue_enabled())
+    with mock.patch.dict(os.environ, {}, clear=True):
+      self.assertFalse(cloudtask.is_cloudtask_push_queue_enabled())
+
+  def test_map_rest_code_to_tq_code(self):
+    self.assertEqual(
+        cloudtask._map_rest_code_to_tq_code(code_pb2.NOT_FOUND),
+        taskqueue_service_pb2.TaskQueueServiceError.UNKNOWN_TASK
+    )
+    self.assertEqual(
+        cloudtask._map_rest_code_to_tq_code(http.HTTPStatus.NOT_FOUND),
+        taskqueue_service_pb2.TaskQueueServiceError.UNKNOWN_TASK
+    )
+    self.assertEqual(
+        cloudtask._map_rest_code_to_tq_code(code_pb2.ALREADY_EXISTS),
+        taskqueue_service_pb2.TaskQueueServiceError.TASK_ALREADY_EXISTS
+    )
+    self.assertEqual(
+        cloudtask._map_rest_code_to_tq_code(code_pb2.INVALID_ARGUMENT),
+        taskqueue_service_pb2.TaskQueueServiceError.INVALID_TASK_NAME
+    )
+    self.assertEqual(
+        cloudtask._map_rest_code_to_tq_code(code_pb2.PERMISSION_DENIED),
+        taskqueue_service_pb2.TaskQueueServiceError.PERMISSION_DENIED
+    )
 
 
 if __name__ == '__main__':

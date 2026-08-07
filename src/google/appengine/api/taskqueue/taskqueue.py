@@ -1564,7 +1564,7 @@ class QueueStatistics(object):
   @classmethod
   def _FetchMultipleQueues(cls, queues, multiple, rpc=None):
     """Internal implementation of fetch stats where queues must be a list."""
-    if str(os.environ.get(cloudtask.ENV_USE_CLOUDTASK_PUSH_QUEUE, '')).lower() == 'true':
+    if cloudtask.is_cloudtask_push_queue_enabled():
       return cloudtask._CloudTaskRPC(lambda: cloudtask.fetch_queue_stats_in_cloud_tasks(queues, multiple))
 
     def ResultHook(rpc):
@@ -1656,7 +1656,7 @@ class Queue(object):
     Raises:
       Error-subclass on application errors.
     """
-    if str(os.environ.get(cloudtask.ENV_USE_CLOUDTASK_PUSH_QUEUE, '')).lower() == 'true' and 'pull' not in self.__name.lower():
+    if cloudtask.is_cloudtask_push_queue_enabled():
       cloudtask.purge_queue_in_cloud_tasks(self.__name)
       return
 
@@ -1795,8 +1795,7 @@ class Queue(object):
 
   def __DeleteTasks(self, tasks, multiple, rpc=None):
     """Internal implementation of delete_tasks_async(), tasks must be a list."""
-    if (str(os.environ.get(cloudtask.ENV_USE_CLOUDTASK_PUSH_QUEUE, '')).lower() == 'true'
-        and 'pull' not in self.__name.lower()
+    if (cloudtask.is_cloudtask_push_queue_enabled()
         and not any(getattr(t, 'method', None) == 'PULL' for t in tasks)):
       return cloudtask._CloudTaskRPC(lambda: cloudtask.delete_tasks_in_cloud_tasks(self.__name, tasks, multiple))
 
@@ -2144,7 +2143,7 @@ class Queue(object):
           'You cannot add both push and pull tasks in a single call.')
 
     # Intercept for Cloud Tasks backend
-    if (str(os.environ.get(cloudtask.ENV_USE_CLOUDTASK_PUSH_QUEUE, '')).lower() == 'true'
+    if (cloudtask.is_cloudtask_push_queue_enabled()
         and has_push_task
         and len(tasks) >= 1):
       if transactional:
