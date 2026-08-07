@@ -15,6 +15,7 @@
 """Cloud Tasks backend integration for Taskqueue SDK."""
 
 import base64
+from concurrent import futures
 import datetime
 import json
 import os
@@ -35,10 +36,12 @@ ENV_GOOGLE_CLOUD_PROJECT = 'GOOGLE_CLOUD_PROJECT'
 ENV_GAE_SERVICE = 'GAE_SERVICE'
 ENV_GAE_VERSION = 'GAE_VERSION'
 
-
-from concurrent import futures
-
+# Sizing & concurrency constants
 _MAX_CONCURRENT_API_CALLS = 100
+_BATCH_CREATE_TASKS_MAX_SIZE = 100
+_BATCH_DELETE_TASKS_MAX_SIZE = 1000
+_METADATA_SERVER_TIMEOUT_SECONDS = 2
+
 _THREAD_POOL = futures.ThreadPoolExecutor(_MAX_CONCURRENT_API_CALLS)
 
 
@@ -70,8 +73,12 @@ class _CloudTaskRPC(object):
     return self._future
 
 
-# Alias for backward compatibility
-_DummyRPC = _CloudTaskRPC
+def _get_project_id():
+  """Extracts and formats the Google Cloud project ID."""
+  project = os.environ.get(ENV_GOOGLE_CLOUD_PROJECT)
+  if project and (project.startswith('s~') or project.startswith('e~')):
+    project = project[2:]
+  return project
 
 
 def _get_region():
@@ -89,7 +96,7 @@ def _get_region():
         'http://metadata.google.internal/computeMetadata/v1/instance/region',
         headers={'Metadata-Flavor': 'Google'},
     )
-    with urllib.request.urlopen(req, timeout=2) as response:
+    with urllib.request.urlopen(req, timeout=_METADATA_SERVER_TIMEOUT_SECONDS) as response:
       region_path = response.read().decode('utf-8')
       return region_path.split('/')[-1]
   except Exception:
@@ -133,14 +140,6 @@ def _build_retry_config(retry_options):
 
 def _build_ct_task_payload(queue_name, task, client, project, region):
   """Builds the Cloud Tasks Task proto payload from GAE Task."""
-  default_hostname = app_identity.get_default_version_hostname()
-  target_val = task.target if isinstance(task.target, str) else None
-  target_service = target_val or os.environ.get(ENV_GAE_SERVICE)
-
-  # Workaround for SDK bug that extracts service name with trailing '-dot'
-  if target_service and target_service.endswith('-dot'):
-    target_service = target_service[:-4]
-
   headers = {}
   if task.headers:
     headers = dict(task.headers)
@@ -175,11 +174,30 @@ def _build_ct_task_payload(queue_name, task, client, project, region):
   }
 
   routing = {}
-  if target_service:
-    routing['service'] = target_service
-    version = os.environ.get(ENV_GAE_VERSION)
-    if version:
-      routing['version'] = version
+  if isinstance(task.target, str) and task.target:
+    target_str = task.target
+    if target_str.endswith('-dot'):
+      target_str = target_str[:-4]
+    target_components = target_str.rsplit('.', 3)
+    target_service = target_components[-1]
+    target_version = len(target_components) > 1 and target_components[-2] or None
+    target_instance = len(target_components) > 2 and target_components[-3] or None
+
+    if target_service:
+      routing['service'] = target_service
+    if target_version:
+      routing['version'] = target_version
+    elif os.environ.get(ENV_GAE_VERSION):
+      routing['version'] = os.environ.get(ENV_GAE_VERSION)
+    if target_instance:
+      routing['instance'] = target_instance
+  else:
+    current_service = os.environ.get(ENV_GAE_SERVICE)
+    if current_service:
+      routing['service'] = current_service
+    current_version = os.environ.get(ENV_GAE_VERSION)
+    if current_version:
+      routing['version'] = current_version
 
   if routing:
     app_engine_http_request['app_engine_routing'] = routing
@@ -211,9 +229,7 @@ def _build_ct_task_payload(queue_name, task, client, project, region):
 def _create_single_task_in_cloud_tasks(queue_name, task, multiple):
   """Helper to create a single task using CloudTasksClient CreateTask API."""
   client = tasks_v2beta3.CloudTasksClient()
-  project = os.environ.get(ENV_GOOGLE_CLOUD_PROJECT)
-  if project and (project.startswith('s~') or project.startswith('e~')):
-    project = project[2:]
+  project = _get_project_id()
   region = _get_region()
 
   parent = client.queue_path(project, region, queue_name)
@@ -245,11 +261,9 @@ def _create_single_task_in_cloud_tasks(queue_name, task, multiple):
 
 
 def _create_batch_tasks_in_cloud_tasks(queue_name, tasks, multiple):
-  """Helper to create tasks in batches of up to 100 using CloudTasksClient BatchCreateTasks API."""
+  """Helper to create tasks in batches using CloudTasksClient BatchCreateTasks API."""
   client = tasks_v2beta3.CloudTasksClient()
-  project = os.environ.get(ENV_GOOGLE_CLOUD_PROJECT)
-  if project and (project.startswith('s~') or project.startswith('e~')):
-    project = project[2:]
+  project = _get_project_id()
   region = _get_region()
 
   parent = client.queue_path(project, region, queue_name)
@@ -265,10 +279,11 @@ def _create_batch_tasks_in_cloud_tasks(queue_name, tasks, multiple):
         )
       task_names.add(task.name)
 
+  from google.appengine.api.taskqueue.taskqueue import _TranslateError, TaskAlreadyExistsError, TombstonedTaskError
+
   created_tasks = []
-  chunk_size = 100
-  for i in range(0, len(tasks), chunk_size):
-    batch = tasks[i : i + chunk_size]
+  for i in range(0, len(tasks), _BATCH_CREATE_TASKS_MAX_SIZE):
+    batch = tasks[i : i + _BATCH_CREATE_TASKS_MAX_SIZE]
     requests_payload = []
     for t in batch:
       ct_task_payload = _build_ct_task_payload(
@@ -280,24 +295,34 @@ def _create_batch_tasks_in_cloud_tasks(queue_name, tasks, multiple):
       op = client.batch_create_tasks(
           request={'parent': parent, 'requests': requests_payload}
       )
-      response_tasks = op.response.tasks if hasattr(op, 'response') and hasattr(op.response, 'tasks') else getattr(op, 'tasks', [])
-      for t, res_task in zip(batch, response_tasks):
-        task_id = res_task.name.split('/')[-1] if hasattr(res_task, 'name') else res_task['name'].split('/')[-1]
-        t._Task__name = task_id
-        t._Task__queue_name = queue_name
-        t._Task__enqueued = True
-        created_tasks.append(t)
-    except (google_exceptions.AlreadyExists, google_exceptions.Conflict) as e:
-      from google.appengine.api.taskqueue.taskqueue import TaskAlreadyExistsError
-      raise TaskAlreadyExistsError(str(e))
-    except google_exceptions.NotFound as e:
-      from google.appengine.api.taskqueue.taskqueue import UnknownQueueError
-      raise UnknownQueueError(str(e))
-    except google_exceptions.BadRequest as e:
-      if 'Queue does not exist' in str(e):
-        from google.appengine.api.taskqueue.taskqueue import UnknownQueueError
-        raise UnknownQueueError(str(e))
-      raise e
+      metadata = getattr(op, 'metadata', {})
+      failed_requests = getattr(metadata, 'failed_requests', getattr(metadata, 'failedRequests', {}))
+      response = getattr(op, 'response', None)
+      response_tasks = getattr(response, 'tasks', []) if response else []
+
+      res_iter = iter(response_tasks)
+      exception = None
+
+      for idx, t in enumerate(batch):
+        error_status = failed_requests.get(idx) or failed_requests.get(str(idx))
+        if error_status:
+          code = getattr(error_status, 'code', None)
+          tq_code = _map_rest_code_to_tq_code(code)
+          if exception is None or isinstance(exception, TaskAlreadyExistsError) or isinstance(exception, TombstonedTaskError):
+            exception = _TranslateError(tq_code)
+        else:
+          try:
+            res_task = next(res_iter)
+            task_id = res_task.name.split('/')[-1] if hasattr(res_task, 'name') else res_task['name'].split('/')[-1]
+            t._Task__name = task_id
+            t._Task__queue_name = queue_name
+            t._Task__enqueued = True
+            created_tasks.append(t)
+          except StopIteration:
+            pass
+
+      if exception is not None:
+        raise exception
     except Exception as e:
       raise e
 
@@ -318,9 +343,7 @@ def create_tasks_in_cloud_tasks(queue_name, tasks, multiple):
 def purge_queue_in_cloud_tasks(queue_name):
   """Purges all tasks in a queue using Cloud Tasks API."""
   client = tasks_v2beta3.CloudTasksClient()
-  project = os.environ.get(ENV_GOOGLE_CLOUD_PROJECT)
-  if project and (project.startswith('s~') or project.startswith('e~')):
-    project = project[2:]
+  project = _get_project_id()
   region = _get_region()
 
   name = client.queue_path(project, region, queue_name)
@@ -349,9 +372,7 @@ def _map_rest_code_to_tq_code(code):
 def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
   """Deletes tasks from a queue using Cloud Tasks Client SDK (supporting BatchDeleteTasks)."""
   client = tasks_v2beta3.CloudTasksClient()
-  project = os.environ.get(ENV_GOOGLE_CLOUD_PROJECT)
-  if project and (project.startswith('s~') or project.startswith('e~')):
-    project = project[2:]
+  project = _get_project_id()
   region = _get_region()
 
   parent = client.queue_path(project, region, queue_name)
@@ -374,9 +395,8 @@ def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
       )
     task_names_set.add(task.name)
 
-  chunk_size = 1000
-  for i in range(0, len(tasks), chunk_size):
-    batch = tasks[i : i + chunk_size]
+  for i in range(0, len(tasks), _BATCH_DELETE_TASKS_MAX_SIZE):
+    batch = tasks[i : i + _BATCH_DELETE_TASKS_MAX_SIZE]
     task_names = [
         client.task_path(project, region, queue_name, t.name) for t in batch
     ]
@@ -420,9 +440,7 @@ def fetch_queue_stats_in_cloud_tasks(queues, multiple):
   from google.protobuf import field_mask_pb2
 
   client = tasks_v2beta3.CloudTasksClient()
-  project = os.environ.get(ENV_GOOGLE_CLOUD_PROJECT)
-  if project and (project.startswith('s~') or project.startswith('e~')):
-    project = project[2:]
+  project = _get_project_id()
   region = _get_region()
 
   queue_stats_list = []
@@ -455,15 +473,11 @@ def fetch_queue_stats_in_cloud_tasks(queues, multiple):
       )
       queue_stats_list.append(qs)
     except google_exceptions.NotFound as e:
-      raise UnknownQueueError(str(e))
+      raise UnknownQueueError(f'Queue {queue_name} not found: {e}')
     except Exception as e:
       raise e
 
   if multiple:
     return queue_stats_list
   else:
-    return queue_stats_list[0]
-
-
-
-
+    return queue_stats_list[0] if queue_stats_list else None

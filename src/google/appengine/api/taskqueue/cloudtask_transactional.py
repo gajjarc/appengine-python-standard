@@ -27,13 +27,15 @@ from google.appengine.api import datastore
 from google.appengine.api.taskqueue import cloudtask
 from google.cloud import tasks_v2beta3
 
+_SWEEPER_MAX_RETRIES = 5
+_SWEEPER_LOCK_TIMEOUT_SECONDS = 60
+_SWEEPER_FAST_PATH_GRACE_SECONDS = 60
+
 
 def build_task_payload_for_transactional_task(queue_name, task):
   """Builds the Cloud Tasks task payload for a transactional task."""
   client = tasks_v2beta3.CloudTasksClient()
-  project = os.environ.get(cloudtask.ENV_GOOGLE_CLOUD_PROJECT)
-  if project and (project.startswith('s~') or project.startswith('e~')):
-    project = project[2:]
+  project = cloudtask._get_project_id()
   region = cloudtask._get_region()
 
   return cloudtask._build_ct_task_payload(queue_name, task, client, project, region)
@@ -42,9 +44,7 @@ def build_task_payload_for_transactional_task(queue_name, task):
 def dispatch_task_payload(queue_name, task_payload):
   """Dispatches a pre-built task payload immediately using CloudTasksClient."""
   client = tasks_v2beta3.CloudTasksClient()
-  project = os.environ.get(cloudtask.ENV_GOOGLE_CLOUD_PROJECT)
-  if project and (project.startswith('s~') or project.startswith('e~')):
-    project = project[2:]
+  project = cloudtask._get_project_id()
   region = cloudtask._get_region()
 
   parent = client.queue_path(project, region, queue_name)
@@ -103,21 +103,21 @@ def _dispatch_pending_keys_now(pending_keys, handled_by_sweeper=False):
     logging.error("Failed to fetch pending transactional tasks: %s", e)
     return
 
-  now = datetime.datetime.utcnow()
+  if not isinstance(entities, list):
+    entities = [entities]
+
   for entity in entities:
     if not entity:
       continue
+    task_name = entity.get('task_name')
     queue_name = entity.get('queue_name')
-    payload_str = entity.get('cloud_task_payload')
-    task_name = entity.get('cloud_task_name')
+    payload_str = entity.get('payload')
 
-    if not payload_str or not queue_name:
-      continue
-
-    # Unconditionally acquire transactional lease before dispatching
+    # Acquire lock on entity to prevent duplicate sweeper dispatches
+    now = datetime.datetime.utcnow()
     try:
       entity['status'] = 'PROCESSING'
-      entity['lock_expires'] = now + datetime.timedelta(seconds=60)
+      entity['lock_expires'] = now + datetime.timedelta(seconds=_SWEEPER_LOCK_TIMEOUT_SECONDS)
       entity['handled_by_sweeper'] = handled_by_sweeper
       with _use_default_datastore_adapter():
         datastore.Put(entity)
@@ -142,7 +142,7 @@ def _dispatch_pending_keys_now(pending_keys, handled_by_sweeper=False):
       retry_count = entity.get('retry_count', 0) + 1
       entity['retry_count'] = retry_count
       entity['last_error'] = str(e)[:500]
-      if retry_count >= 5:
+      if retry_count >= _SWEEPER_MAX_RETRIES:
         entity['status'] = 'FAILED'
         entity['lock_expires'] = None
       else:
@@ -178,65 +178,75 @@ def _register_post_commit_dispatch(queue_name, pending_keys):
     )
 
 
-def _patched_RunInTransaction(function, *args, **kwargs):
-  prev_context = _start_tx_context()
-  try:
-    result = _original_RunInTransaction(function, *args, **kwargs)
-    pending_keys = _get_tx_pending()
-    if pending_keys:
-      _dispatch_pending_keys_now(pending_keys)
-    return result
-  finally:
-    _restore_tx_context(prev_context)
-
-
-_original_RunInTransaction = datastore.RunInTransaction
-datastore.RunInTransaction = _patched_RunInTransaction
-
-
 def add_transactional_tasks(queue_name, tasks, multiple):
-  """Enqueues transactional tasks into Datastore outbox."""
-  # Generate names for unnamed tasks so they are immediately available
-  for t in tasks:
-    if not t.name:
-      import uuid
+  """Stages transactional tasks in Datastore within the active transaction."""
+  import uuid
 
-      t._Task__name = "task-" + str(uuid.uuid4())
+  # Check pre-conditions (duplicate names or already queued)
+  task_names_set = set()
+  for task in tasks:
+    if task.name:
+      from google.appengine.api.taskqueue.taskqueue import InvalidTaskNameError
 
-  task_records = []
-  for t in tasks:
-    ct_payload = build_task_payload_for_transactional_task(queue_name, t)
-    # Convert Timestamp to dict for JSON serialization if present
-    if 'schedule_time' in ct_payload and hasattr(ct_payload['schedule_time'], 'seconds'):
-      st = ct_payload['schedule_time']
-      ct_payload = dict(ct_payload)
-      ct_payload['schedule_time'] = {'seconds': st.seconds, 'nanos': st.nanos}
-    # Convert body bytes to base64 string for JSON storing
-    if 'app_engine_http_request' in ct_payload:
-      ae_req = dict(ct_payload['app_engine_http_request'])
-      if 'body' in ae_req and isinstance(ae_req['body'], bytes):
-        ae_req['body'] = base64.b64encode(ae_req['body']).decode('utf-8')
-      ct_payload['app_engine_http_request'] = ae_req
-    task_records.append((t.name, ct_payload))
+      raise InvalidTaskNameError(
+          'A task bound to a transaction cannot be named.'
+      )
+    if task.was_enqueued:
+      from google.appengine.api.taskqueue.taskqueue import BadTaskStateError
+
+      raise BadTaskStateError('The task has already been enqueued.')
 
   pending_keys = []
-  for t_name, payload in task_records:
+  for task in tasks:
+    task_uuid = uuid.uuid4().hex
+    generated_name = f"tx-{task_uuid}"
+    task._Task__name = generated_name
+    task._Task__queue_name = queue_name
+
+    ct_task_payload = build_task_payload_for_transactional_task(
+        queue_name, task
+    )
+
+    # Serialize payload for storage in Datastore
+    st_dict = None
+    if 'schedule_time' in ct_task_payload:
+      st = ct_task_payload['schedule_time']
+      st_dict = {'seconds': getattr(st, 'seconds', 0), 'nanos': getattr(st, 'nanos', 0)}
+
+    ae_req = dict(ct_task_payload['app_engine_http_request'])
+    body_serialized = ae_req.get('body', b'')
+    if isinstance(body_serialized, bytes):
+      body_serialized = base64.b64encode(body_serialized).decode('utf-8')
+    ae_req['body'] = body_serialized
+
+    serializable_payload = {
+        'name': ct_task_payload.get('name'),
+        'app_engine_http_request': ae_req,
+    }
+    if st_dict:
+      serializable_payload['schedule_time'] = st_dict
+    if 'retry_config' in ct_task_payload:
+      serializable_payload['retry_config'] = ct_task_payload['retry_config']
+
     entity = datastore.Entity('_AE_PendingCloudTask')
+    entity['task_name'] = generated_name
     entity['queue_name'] = queue_name
-    entity['cloud_task_name'] = t_name
-    entity['cloud_task_payload'] = json.dumps(payload)
-    entity['created'] = datetime.datetime.utcnow()
+    entity['payload'] = json.dumps(serializable_payload)
     entity['status'] = 'PENDING'
-    entity['lock_expires'] = None
+    entity['created'] = datetime.datetime.utcnow()
     entity['retry_count'] = 0
-    entity['last_error'] = ''
-    entity['handled_by_sweeper'] = False
-    entity['sdk_lang'] = 'PYTHON'
+
     with _use_default_datastore_adapter():
       datastore.Put(entity)
     pending_keys.append(entity.key())
+    task._Task__enqueued = True
 
   _register_post_commit_dispatch(queue_name, pending_keys)
+
+  if multiple:
+    return tasks
+  else:
+    return tasks[0]
 
 
 def sweep():
@@ -267,11 +277,11 @@ def sweep():
 
     created = entity.get('created')
     if status == 'PENDING' and created and isinstance(created, datetime.datetime):
-      if (now - created).total_seconds() < 60:
-        continue  # give fast-path 60s to dispatch post-commit
+      if (now - created).total_seconds() < _SWEEPER_FAST_PATH_GRACE_SECONDS:
+        continue  # give fast-path grace period to dispatch post-commit
 
     retry_count = entity.get('retry_count', 0)
-    if status == 'FAILED' and retry_count >= 5:
+    if status == 'FAILED' and retry_count >= _SWEEPER_MAX_RETRIES:
       continue  # exceeded max sweeper retries
 
     keys_to_dispatch.append(entity.key())

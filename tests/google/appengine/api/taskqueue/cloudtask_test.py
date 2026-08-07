@@ -59,6 +59,29 @@ class CloudtaskTest(unittest.TestCase):
         'worker'
     )
 
+  @mock.patch.dict(os.environ, {}, clear=True)
+  @mock.patch('google.appengine.api.app_identity.get_default_version_hostname', return_value='app.appspot.com')
+  def test_build_ct_task_payload_with_version_service_target(self, _):
+    task = taskqueue.Task(url='/test', target='v2.worker')
+    payload = cloudtask._build_ct_task_payload(
+        queue_name='default',
+        task=task,
+        client=self.mock_client,
+        project='p',
+        region='us-central1'
+    )
+    routing = payload['app_engine_http_request'].get('app_engine_routing', {})
+    self.assertEqual(routing.get('service'), 'worker')
+    self.assertEqual(routing.get('version'), 'v2')
+
+  def test_get_project_id(self):
+    with mock.patch.dict(os.environ, {cloudtask.ENV_GOOGLE_CLOUD_PROJECT: 's~my-app'}):
+      self.assertEqual(cloudtask._get_project_id(), 'my-app')
+    with mock.patch.dict(os.environ, {cloudtask.ENV_GOOGLE_CLOUD_PROJECT: 'e~my-app'}):
+      self.assertEqual(cloudtask._get_project_id(), 'my-app')
+    with mock.patch.dict(os.environ, {cloudtask.ENV_GOOGLE_CLOUD_PROJECT: 'my-app'}):
+      self.assertEqual(cloudtask._get_project_id(), 'my-app')
+
 
 if __name__ == '__main__':
   unittest.main()
