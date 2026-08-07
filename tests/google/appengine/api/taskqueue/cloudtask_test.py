@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import datetime
 import http
 import os
+import time
 import unittest
 from unittest import mock
 from google.appengine.api.taskqueue import cloudtask
@@ -76,6 +78,35 @@ class CloudtaskTest(unittest.TestCase):
     routing = payload['app_engine_http_request'].get('app_engine_routing', {})
     self.assertEqual(routing.get('service'), 'worker')
     self.assertEqual(routing.get('version'), 'v2')
+
+  def test_build_ct_task_payload_with_countdown(self):
+    now = time.time()
+    countdown_seconds = 60
+    task = taskqueue.Task(url='/test', countdown=countdown_seconds)
+    payload = cloudtask._build_ct_task_payload(
+        queue_name='default',
+        task=task,
+        client=self.mock_client,
+        project='p',
+        region='us-central1'
+    )
+    self.assertIn('schedule_time', payload)
+    st = payload['schedule_time']
+    self.assertAlmostEqual(st.seconds, int(now + countdown_seconds), delta=2)
+
+  def test_build_ct_task_payload_with_eta(self):
+    eta = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=120)
+    task = taskqueue.Task(url='/test', eta=eta)
+    payload = cloudtask._build_ct_task_payload(
+        queue_name='default',
+        task=task,
+        client=self.mock_client,
+        project='p',
+        region='us-central1'
+    )
+    self.assertIn('schedule_time', payload)
+    st = payload['schedule_time']
+    self.assertAlmostEqual(st.seconds, int(eta.timestamp()), delta=2)
 
   def test_get_project_id(self):
     with mock.patch.dict(os.environ, {cloudtask.ENV_GOOGLE_CLOUD_PROJECT: 's~my-app'}):
