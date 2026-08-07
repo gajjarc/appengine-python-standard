@@ -23,14 +23,31 @@ import urllib.request
 from google.api_core import exceptions as google_exceptions
 from google.appengine.api import app_identity
 from google.cloud import tasks_v2beta3
-from google.protobuf import json_format
 from google.protobuf.timestamp_pb2 import Timestamp
-import google.auth
-from google.auth.transport.requests import Request
+
+# Environment variable constants
+ENV_USE_CLOUDTASK_PUSH_QUEUE = 'APPENGINE_USE_CLOUDTASK_PUSH_QUEUE'
+ENV_LOCATION_ID = 'LOCATION_ID'
+ENV_GAE_LOCATION = 'GAE_LOCATION'
+ENV_GAE_REGION = 'GAE_REGION'
+ENV_LOCAL_GCP_REGION = 'LOCAL_GCP_REGION'
+ENV_GOOGLE_CLOUD_PROJECT = 'GOOGLE_CLOUD_PROJECT'
+ENV_GAE_SERVICE = 'GAE_SERVICE'
+ENV_GAE_VERSION = 'GAE_VERSION'
 
 
 class _DummyRPC(object):
-  """A dummy RPC object to wrap synchronous calls for async compatibility."""
+  """A dummy RPC object wrapping synchronous CloudTasksClient calls.
+
+  The legacy App Engine TaskQueue SDK provides async methods (e.g.
+  add_async, delete_tasks_async, purge_async, fetch_async) that return an
+  RPC object with a .get_result() method. Synchronous methods invoke these
+  async variants and call .get_result() on the returned RPC object.
+
+  Since CloudTasksClient calls execute synchronously, _DummyRPC wraps the
+  returned value so that both synchronous callers (via get_result) and
+  asynchronous callers receive a consistent RPC interface.
+  """
 
   def __init__(self, result_provider):
     self._result_provider = result_provider
@@ -47,14 +64,18 @@ class _DummyRPC(object):
 
 def _get_region():
   """Determines the App Engine region."""
-  region = os.environ.get('LOCATION_ID') or os.environ.get('GAE_LOCATION') or os.environ.get('GAE_REGION')
+  region = (
+      os.environ.get(ENV_LOCATION_ID)
+      or os.environ.get(ENV_GAE_LOCATION)
+      or os.environ.get(ENV_GAE_REGION)
+  )
   if region:
     return region
 
   try:
     req = urllib.request.Request(
         'http://metadata.google.internal/computeMetadata/v1/instance/region',
-        headers={'Metadata-Flavor': 'Google'}
+        headers={'Metadata-Flavor': 'Google'},
     )
     with urllib.request.urlopen(req, timeout=2) as response:
       region_path = response.read().decode('utf-8')
@@ -63,7 +84,7 @@ def _get_region():
     pass
 
   # Fallback to us-central1 if we can't detect it
-  return os.environ.get('LOCAL_GCP_REGION', 'us-central1')
+  return os.environ.get(ENV_LOCAL_GCP_REGION, 'us-central1')
 
 
 def _to_duration(seconds):
@@ -102,7 +123,7 @@ def _build_ct_task_payload(queue_name, task, client, project, region):
   """Builds the Cloud Tasks Task proto payload from GAE Task."""
   default_hostname = app_identity.get_default_version_hostname()
   target_val = task.target if isinstance(task.target, str) else None
-  target_service = target_val or os.environ.get('GAE_SERVICE')
+  target_service = target_val or os.environ.get(ENV_GAE_SERVICE)
 
   # Workaround for SDK bug that extracts service name with trailing '-dot'
   if target_service and target_service.endswith('-dot'):
@@ -144,7 +165,7 @@ def _build_ct_task_payload(queue_name, task, client, project, region):
   routing = {}
   if target_service:
     routing['service'] = target_service
-    version = os.environ.get('GAE_VERSION')
+    version = os.environ.get(ENV_GAE_VERSION)
     if version:
       routing['version'] = version
 
@@ -175,76 +196,10 @@ def _build_ct_task_payload(queue_name, task, client, project, region):
   return ct_task
 
 
-def _get_auth_headers():
-  """Generates pure HTTP authentication headers via ADC."""
-  credentials, _ = google.auth.default()
-  if not credentials.valid:
-    credentials.refresh(Request())
-  return {
-      'Authorization': f'Bearer {credentials.token}',
-      'Content-Type': 'application/json'
-  }
-
-
-def _convert_to_rest_payload(ct_task):
-  """Converts a hybrid proto-dict task to a pure JSON dict for REST API."""
-  rest_task = {}
-
-  if 'name' in ct_task:
-    rest_task['name'] = ct_task['name']
-
-  if 'app_engine_http_request' in ct_task:
-    ae_req = ct_task['app_engine_http_request']
-    rest_ae_req = {}
-
-    method_val = ae_req.get('http_method', tasks_v2beta3.HttpMethod.POST)
-    if hasattr(method_val, 'name'):
-      rest_ae_req['http_method'] = method_val.name
-    elif isinstance(method_val, int):
-      rest_ae_req['http_method'] = tasks_v2beta3.HttpMethod(method_val).name
-    else:
-      rest_ae_req['http_method'] = str(method_val)
-
-    rest_ae_req['relative_uri'] = ae_req.get('relative_uri', '/')
-
-    body_bytes = ae_req.get('body', b'')
-    if body_bytes:
-      rest_ae_req['body'] = base64.b64encode(body_bytes).decode('utf-8')
-
-    if 'headers' in ae_req:
-      rest_ae_req['headers'] = ae_req['headers']
-
-    if 'app_engine_routing' in ae_req:
-      rest_ae_req['app_engine_routing'] = ae_req['app_engine_routing']
-
-    rest_task['app_engine_http_request'] = rest_ae_req
-
-  if 'schedule_time' in ct_task:
-    rest_task['schedule_time'] = json_format.MessageToDict(
-        ct_task['schedule_time']
-    )
-
-  if 'retry_config' in ct_task:
-    rc = ct_task['retry_config']
-    rest_rc = {}
-    if 'max_attempts' in rc:
-      rest_rc['max_attempts'] = rc['max_attempts']
-    if 'max_doublings' in rc:
-      rest_rc['max_doublings'] = rc['max_doublings']
-
-    for duration_field in ['max_retry_duration', 'min_backoff', 'max_backoff']:
-      if duration_field in rc and rc[duration_field]:
-        rest_rc[duration_field] = json_format.MessageToDict(rc[duration_field])
-
-    rest_task['retry_config'] = rest_rc
-
-  return rest_task
-
-
 def _create_single_task_in_cloud_tasks(queue_name, task, multiple):
   """Helper to create a single task using CloudTasksClient CreateTask API."""
   client = tasks_v2beta3.CloudTasksClient()
-  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  project = os.environ.get(ENV_GOOGLE_CLOUD_PROJECT)
   if project and (project.startswith('s~') or project.startswith('e~')):
     project = project[2:]
   region = _get_region()
@@ -280,7 +235,7 @@ def _create_single_task_in_cloud_tasks(queue_name, task, multiple):
 def _create_batch_tasks_in_cloud_tasks(queue_name, tasks, multiple):
   """Helper to create tasks in batches of up to 100 using CloudTasksClient BatchCreateTasks API."""
   client = tasks_v2beta3.CloudTasksClient()
-  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  project = os.environ.get(ENV_GOOGLE_CLOUD_PROJECT)
   if project and (project.startswith('s~') or project.startswith('e~')):
     project = project[2:]
   region = _get_region()
@@ -351,7 +306,7 @@ def create_tasks_in_cloud_tasks(queue_name, tasks, multiple):
 def purge_queue_in_cloud_tasks(queue_name):
   """Purges all tasks in a queue using Cloud Tasks API."""
   client = tasks_v2beta3.CloudTasksClient()
-  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  project = os.environ.get(ENV_GOOGLE_CLOUD_PROJECT)
   if project and (project.startswith('s~') or project.startswith('e~')):
     project = project[2:]
   region = _get_region()
@@ -382,7 +337,7 @@ def _map_rest_code_to_tq_code(code):
 def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
   """Deletes tasks from a queue using Cloud Tasks Client SDK (supporting BatchDeleteTasks)."""
   client = tasks_v2beta3.CloudTasksClient()
-  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  project = os.environ.get(ENV_GOOGLE_CLOUD_PROJECT)
   if project and (project.startswith('s~') or project.startswith('e~')):
     project = project[2:]
   region = _get_region()
@@ -453,7 +408,7 @@ def fetch_queue_stats_in_cloud_tasks(queues, multiple):
   from google.protobuf import field_mask_pb2
 
   client = tasks_v2beta3.CloudTasksClient()
-  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  project = os.environ.get(ENV_GOOGLE_CLOUD_PROJECT)
   if project and (project.startswith('s~') or project.startswith('e~')):
     project = project[2:]
   region = _get_region()

@@ -47,8 +47,10 @@ from google.appengine.api import urlfetch
 from google.appengine.api.taskqueue import taskqueue_service_bytes_pb2 as taskqueue_service_pb2
 from google.appengine.runtime import apiproxy_errors
 from google.appengine.api.taskqueue import cloudtask
-if str(os.environ.get('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE', '')).lower() == 'true':
+if str(os.environ.get(cloudtask.ENV_USE_CLOUDTASK_PUSH_QUEUE, '')).lower() == 'true':
   from google.appengine.api.taskqueue import cloudtask_transactional
+else:
+  cloudtask_transactional = None
 from google.appengine.runtime import context
 import six
 from six.moves import urllib
@@ -1565,8 +1567,7 @@ class QueueStatistics(object):
   @classmethod
   def _FetchMultipleQueues(cls, queues, multiple, rpc=None):
     """Internal implementation of fetch stats where queues must be a list."""
-    if str(os.environ.get('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE', '')).lower() == 'true':
-      from google.appengine.api.taskqueue import cloudtask
+    if str(os.environ.get(cloudtask.ENV_USE_CLOUDTASK_PUSH_QUEUE, '')).lower() == 'true':
       result = cloudtask.fetch_queue_stats_in_cloud_tasks(queues, multiple)
       return cloudtask._DummyRPC(lambda: result)
 
@@ -1659,9 +1660,7 @@ class Queue(object):
     Raises:
       Error-subclass on application errors.
     """
-    import os
-    if str(os.environ.get('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE', '')).lower() == 'true' and 'pull' not in self.__name.lower():
-      from google.appengine.api.taskqueue import cloudtask
+    if str(os.environ.get(cloudtask.ENV_USE_CLOUDTASK_PUSH_QUEUE, '')).lower() == 'true' and 'pull' not in self.__name.lower():
       cloudtask.purge_queue_in_cloud_tasks(self.__name)
       return
 
@@ -1800,11 +1799,9 @@ class Queue(object):
 
   def __DeleteTasks(self, tasks, multiple, rpc=None):
     """Internal implementation of delete_tasks_async(), tasks must be a list."""
-    import os
-    if (str(os.environ.get('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE', '')).lower() == 'true'
+    if (str(os.environ.get(cloudtask.ENV_USE_CLOUDTASK_PUSH_QUEUE, '')).lower() == 'true'
         and 'pull' not in self.__name.lower()
         and not any(getattr(t, 'method', None) == 'PULL' for t in tasks)):
-      from google.appengine.api.taskqueue import cloudtask
       result = cloudtask.delete_tasks_in_cloud_tasks(self.__name, tasks, multiple)
       return cloudtask._DummyRPC(lambda: result)
 
@@ -2152,13 +2149,15 @@ class Queue(object):
           'You cannot add both push and pull tasks in a single call.')
 
     # Intercept for Cloud Tasks backend
-    import os
-    if (str(os.environ.get('APPENGINE_USE_CLOUDTASK_PUSH_QUEUE', '')).lower() == 'true'
+    if (str(os.environ.get(cloudtask.ENV_USE_CLOUDTASK_PUSH_QUEUE, '')).lower() == 'true'
         and has_push_task
         and len(tasks) >= 1):
       if transactional:
-        from google.appengine.api.taskqueue import cloudtask_transactional
-        cloudtask_transactional.add_transactional_tasks(self.__name, tasks, multiple)
+        if cloudtask_transactional:
+          cloudtask_transactional.add_transactional_tasks(self.__name, tasks, multiple)
+        else:
+          from google.appengine.api.taskqueue import cloudtask_transactional as ct_tx
+          ct_tx.add_transactional_tasks(self.__name, tasks, multiple)
         return cloudtask._DummyRPC(lambda: tasks if multiple else tasks[0])
       else:
         result = cloudtask.create_tasks_in_cloud_tasks(self.__name, tasks, multiple)

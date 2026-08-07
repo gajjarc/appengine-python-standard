@@ -28,33 +28,38 @@ from google.appengine.api.taskqueue import cloudtask
 from google.cloud import tasks_v2beta3
 
 
-def build_rest_payload_for_transactional_task(queue_name, task):
-  """Builds the REST task payload for a transactional task."""
+def build_task_payload_for_transactional_task(queue_name, task):
+  """Builds the Cloud Tasks task payload for a transactional task."""
   client = tasks_v2beta3.CloudTasksClient()
-  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  project = os.environ.get(cloudtask.ENV_GOOGLE_CLOUD_PROJECT)
   if project and (project.startswith('s~') or project.startswith('e~')):
     project = project[2:]
   region = cloudtask._get_region()
 
-  ct_task = cloudtask._build_ct_task_payload(queue_name, task, client, project, region)
-  return cloudtask._convert_to_rest_payload(ct_task)
+  return cloudtask._build_ct_task_payload(queue_name, task, client, project, region)
 
 
-def dispatch_rest_task(queue_name, task_payload):
+def dispatch_task_payload(queue_name, task_payload):
   """Dispatches a pre-built task payload immediately using CloudTasksClient."""
   client = tasks_v2beta3.CloudTasksClient()
-  project = os.environ.get('GOOGLE_CLOUD_PROJECT')
+  project = os.environ.get(cloudtask.ENV_GOOGLE_CLOUD_PROJECT)
   if project and (project.startswith('s~') or project.startswith('e~')):
     project = project[2:]
   region = cloudtask._get_region()
 
   parent = client.queue_path(project, region, queue_name)
 
-  # Unpack base64 body if encoded by _convert_to_rest_payload
+  # Prepare task payload for GAPIC client call
   if 'app_engine_http_request' in task_payload:
-    ae_req = task_payload['app_engine_http_request']
+    ae_req = dict(task_payload['app_engine_http_request'])
     if 'body' in ae_req and isinstance(ae_req['body'], str):
       ae_req['body'] = base64.b64decode(ae_req['body'].encode('utf-8'))
+    task_payload['app_engine_http_request'] = ae_req
+
+  if 'schedule_time' in task_payload and isinstance(task_payload['schedule_time'], dict):
+    from google.protobuf.timestamp_pb2 import Timestamp
+    st = task_payload['schedule_time']
+    task_payload['schedule_time'] = Timestamp(seconds=st.get('seconds', 0), nanos=st.get('nanos', 0))
 
   client.create_task(request={'parent': parent, 'task': task_payload})
 
@@ -122,7 +127,7 @@ def _dispatch_pending_keys_now(pending_keys, handled_by_sweeper=False):
 
     try:
       payload = json.loads(payload_str)
-      dispatch_rest_task(queue_name, payload)
+      dispatch_task_payload(queue_name, payload)
       with _use_default_datastore_adapter():
         datastore.Delete(entity.key())
       logging.info("Successfully dispatched transactional task %s", task_name)
@@ -198,13 +203,24 @@ def add_transactional_tasks(queue_name, tasks, multiple):
 
       t._Task__name = "task-" + str(uuid.uuid4())
 
-  rest_tasks = []
+  task_records = []
   for t in tasks:
-    ct_payload = build_rest_payload_for_transactional_task(queue_name, t)
-    rest_tasks.append((t.name, ct_payload))
+    ct_payload = build_task_payload_for_transactional_task(queue_name, t)
+    # Convert Timestamp to dict for JSON serialization if present
+    if 'schedule_time' in ct_payload and hasattr(ct_payload['schedule_time'], 'seconds'):
+      st = ct_payload['schedule_time']
+      ct_payload = dict(ct_payload)
+      ct_payload['schedule_time'] = {'seconds': st.seconds, 'nanos': st.nanos}
+    # Convert body bytes to base64 string for JSON storing
+    if 'app_engine_http_request' in ct_payload:
+      ae_req = dict(ct_payload['app_engine_http_request'])
+      if 'body' in ae_req and isinstance(ae_req['body'], bytes):
+        ae_req['body'] = base64.b64encode(ae_req['body']).decode('utf-8')
+      ct_payload['app_engine_http_request'] = ae_req
+    task_records.append((t.name, ct_payload))
 
   pending_keys = []
-  for t_name, payload in rest_tasks:
+  for t_name, payload in task_records:
     entity = datastore.Entity('_AE_PendingCloudTask')
     entity['queue_name'] = queue_name
     entity['cloud_task_name'] = t_name
