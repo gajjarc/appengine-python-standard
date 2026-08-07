@@ -1560,9 +1560,7 @@ class QueueStatistics(object):
 
       return []
 
-    rpc = create_rpc(deadline)
-    cls.fetch_async(queue_or_queues, rpc)
-    return rpc.get_result()
+    return cls.fetch_async(queue_or_queues).get_result()
 
   @classmethod
   def _FetchMultipleQueues(cls, queues, multiple, rpc=None):
@@ -2504,9 +2502,7 @@ class Queue(object):
       Error-subclass on application errors.
     """
     _ValidateDeadline(deadline)
-    rpc = create_rpc(deadline)
-    self.fetch_statistics_async(rpc)
-    return rpc.get_result()
+    return self.fetch_statistics_async().get_result()
 
   def __repr__(self):
     ATTRS = ['name']
