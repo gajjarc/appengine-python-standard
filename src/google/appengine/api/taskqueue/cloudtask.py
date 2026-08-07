@@ -51,9 +51,150 @@ _METADATA_SERVER_TIMEOUT_SECONDS = 2
 _THREAD_POOL = futures.ThreadPoolExecutor(_MAX_CONCURRENT_API_CALLS)
 
 
+# ==============================================================================
+# Public APIs
+# ==============================================================================
+
+
 def is_cloudtask_push_queue_enabled():
   """Checks if Cloud Tasks backend is enabled for Push Queues."""
   return str(os.environ.get(ENV_USE_CLOUDTASK_PUSH_QUEUE, '')).lower() == 'true'
+
+
+def create_tasks_in_cloud_tasks(queue_name, tasks, multiple):
+  """Creates one or more tasks using Cloud Tasks API (supporting BatchCreateTasks)."""
+  if len(tasks) == 1:
+    return _create_single_task_in_cloud_tasks(queue_name, tasks[0], multiple)
+  else:
+    return _create_batch_tasks_in_cloud_tasks(queue_name, tasks, multiple)
+
+
+def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
+  """Deletes tasks from a queue using Cloud Tasks Client SDK (supporting BatchDeleteTasks)."""
+  client = tasks_v2beta3.CloudTasksClient()
+  project = _get_project_id()
+  region = _get_region()
+
+  parent = client.queue_path(project, region, queue_name)
+
+  # Check pre-conditions (duplicate names or already deleted)
+  task_names_set = set()
+  for task in tasks:
+    if not task.name:
+      raise taskqueue.BadTaskStateError('A task name must be specified for a task')
+    if task.was_deleted:
+      raise taskqueue.BadTaskStateError(
+          'The task %s has already been deleted' % task.name
+      )
+    if task.name in task_names_set:
+      raise taskqueue.DuplicateTaskNameError(
+          'The task name %s is duplicated' % task.name
+      )
+    task_names_set.add(task.name)
+
+  for i in range(0, len(tasks), _BATCH_DELETE_TASKS_MAX_SIZE):
+    batch = tasks[i : i + _BATCH_DELETE_TASKS_MAX_SIZE]
+    task_names = [
+        client.task_path(project, region, queue_name, t.name) for t in batch
+    ]
+
+    try:
+      op = client.batch_delete_tasks(
+          request={'parent': parent, 'names': task_names}
+      )
+      metadata = getattr(op, 'metadata', {})
+      failed_requests = getattr(metadata, 'failed_requests', getattr(metadata, 'failedRequests', {}))
+
+      exception = None
+      for idx, t in enumerate(batch):
+        error_status = failed_requests.get(idx) or failed_requests.get(str(idx))
+        if error_status:
+          code = getattr(error_status, 'code', None)
+          tq_code = _map_rest_code_to_tq_code(code)
+          if tq_code in [taskqueue_service_pb2.TaskQueueServiceError.UNKNOWN_TASK, taskqueue_service_pb2.TaskQueueServiceError.TOMBSTONED_TASK]:
+            t._Task__deleted = False
+          elif exception is None:
+            exception = taskqueue._TranslateError(tq_code)
+        else:
+          t._Task__deleted = True
+
+      if exception is not None:
+        raise exception
+    except Exception as e:
+      raise e
+
+  if multiple:
+    return tasks
+  else:
+    return tasks[0]
+
+
+def purge_queue_in_cloud_tasks(queue_name):
+  """Purges all tasks in a queue using Cloud Tasks API."""
+  client = tasks_v2beta3.CloudTasksClient()
+  project = _get_project_id()
+  region = _get_region()
+
+  name = client.queue_path(project, region, queue_name)
+  try:
+    client.purge_queue(request={'name': name})
+    print(
+        f"Jetski: Successfully purged queue {queue_name} using Cloud Tasks",
+        flush=True,
+    )
+  except Exception as e:
+    raise e
+
+
+def fetch_queue_stats_in_cloud_tasks(queues, multiple):
+  """Fetches queue statistics for given queues using Cloud Tasks API."""
+  client = tasks_v2beta3.CloudTasksClient()
+  project = _get_project_id()
+  region = _get_region()
+
+  queue_stats_list = []
+  read_mask = field_mask_pb2.FieldMask(paths=['stats'])
+
+  for queue in queues:
+    queue_name = queue.name if hasattr(queue, 'name') else str(queue)
+    name = client.queue_path(project, region, queue_name)
+    try:
+      q_resp = client.get_queue(request={'name': name, 'read_mask': read_mask})
+      ct_stats = getattr(q_resp, 'stats', None)
+
+      tasks = getattr(ct_stats, 'tasks_count', 0) if ct_stats else 0
+      oldest_eta_usec = None
+      if ct_stats and getattr(ct_stats, 'oldest_estimated_arrival_time', None):
+        oldest_eta = ct_stats.oldest_estimated_arrival_time
+        oldest_eta_usec = int(oldest_eta.timestamp() * 1e6)
+
+      executed_last_minute = getattr(ct_stats, 'executed_last_minute_count', 0) if ct_stats else 0
+      in_flight = getattr(ct_stats, 'concurrent_dispatches_count', 0) if ct_stats else 0
+      enforced_rate = getattr(ct_stats, 'effective_execution_rate', 0.0) if ct_stats else 0.0
+
+      qs = taskqueue.QueueStatistics(
+          queue=queue,
+          tasks=tasks,
+          oldest_eta_usec=oldest_eta_usec,
+          executed_last_minute=executed_last_minute,
+          in_flight=in_flight,
+          enforced_rate=enforced_rate,
+      )
+      queue_stats_list.append(qs)
+    except google_exceptions.NotFound as e:
+      raise taskqueue.UnknownQueueError(f'Queue {queue_name} not found: {e}')
+    except Exception as e:
+      raise e
+
+  if multiple:
+    return queue_stats_list
+  else:
+    return queue_stats_list[0] if queue_stats_list else None
+
+
+# ==============================================================================
+# Private Helpers
+# ==============================================================================
 
 
 class _CloudTaskRPC(object):
@@ -336,31 +477,6 @@ def _create_batch_tasks_in_cloud_tasks(queue_name, tasks, multiple):
     return created_tasks[0]
 
 
-def create_tasks_in_cloud_tasks(queue_name, tasks, multiple):
-  """Creates one or more tasks using Cloud Tasks API (supporting BatchCreateTasks)."""
-  if len(tasks) == 1:
-    return _create_single_task_in_cloud_tasks(queue_name, tasks[0], multiple)
-  else:
-    return _create_batch_tasks_in_cloud_tasks(queue_name, tasks, multiple)
-
-
-def purge_queue_in_cloud_tasks(queue_name):
-  """Purges all tasks in a queue using Cloud Tasks API."""
-  client = tasks_v2beta3.CloudTasksClient()
-  project = _get_project_id()
-  region = _get_region()
-
-  name = client.queue_path(project, region, queue_name)
-  try:
-    client.purge_queue(request={'name': name})
-    print(
-        f"Jetski: Successfully purged queue {queue_name} using Cloud Tasks",
-        flush=True,
-    )
-  except Exception as e:
-    raise e
-
-
 def _map_rest_code_to_tq_code(code):
   """Maps gRPC / HTTP error status codes to legacy TaskQueue error enum codes."""
   if code in [code_pb2.NOT_FOUND, http.HTTPStatus.NOT_FOUND]:
@@ -372,109 +488,3 @@ def _map_rest_code_to_tq_code(code):
   if code in [code_pb2.PERMISSION_DENIED, http.HTTPStatus.FORBIDDEN]:
     return taskqueue_service_pb2.TaskQueueServiceError.PERMISSION_DENIED
   return taskqueue_service_pb2.TaskQueueServiceError.INTERNAL_ERROR
-
-
-def delete_tasks_in_cloud_tasks(queue_name, tasks, multiple):
-  """Deletes tasks from a queue using Cloud Tasks Client SDK (supporting BatchDeleteTasks)."""
-  client = tasks_v2beta3.CloudTasksClient()
-  project = _get_project_id()
-  region = _get_region()
-
-  parent = client.queue_path(project, region, queue_name)
-
-  # Check pre-conditions (duplicate names or already deleted)
-  task_names_set = set()
-  for task in tasks:
-    if not task.name:
-      raise taskqueue.BadTaskStateError('A task name must be specified for a task')
-    if task.was_deleted:
-      raise taskqueue.BadTaskStateError(
-          'The task %s has already been deleted' % task.name
-      )
-    if task.name in task_names_set:
-      raise taskqueue.DuplicateTaskNameError(
-          'The task name %s is duplicated' % task.name
-      )
-    task_names_set.add(task.name)
-
-  for i in range(0, len(tasks), _BATCH_DELETE_TASKS_MAX_SIZE):
-    batch = tasks[i : i + _BATCH_DELETE_TASKS_MAX_SIZE]
-    task_names = [
-        client.task_path(project, region, queue_name, t.name) for t in batch
-    ]
-
-    try:
-      op = client.batch_delete_tasks(
-          request={'parent': parent, 'names': task_names}
-      )
-      metadata = getattr(op, 'metadata', {})
-      failed_requests = getattr(metadata, 'failed_requests', getattr(metadata, 'failedRequests', {}))
-
-      exception = None
-      for idx, t in enumerate(batch):
-        error_status = failed_requests.get(idx) or failed_requests.get(str(idx))
-        if error_status:
-          code = getattr(error_status, 'code', None)
-          tq_code = _map_rest_code_to_tq_code(code)
-          if tq_code in [taskqueue_service_pb2.TaskQueueServiceError.UNKNOWN_TASK, taskqueue_service_pb2.TaskQueueServiceError.TOMBSTONED_TASK]:
-            t._Task__deleted = False
-          elif exception is None:
-            exception = taskqueue._TranslateError(tq_code)
-        else:
-          t._Task__deleted = True
-
-      if exception is not None:
-        raise exception
-    except Exception as e:
-      raise e
-
-  if multiple:
-    return tasks
-  else:
-    return tasks[0]
-
-
-def fetch_queue_stats_in_cloud_tasks(queues, multiple):
-  """Fetches queue statistics for given queues using Cloud Tasks API."""
-  client = tasks_v2beta3.CloudTasksClient()
-  project = _get_project_id()
-  region = _get_region()
-
-  queue_stats_list = []
-  read_mask = field_mask_pb2.FieldMask(paths=['stats'])
-
-  for queue in queues:
-    queue_name = queue.name if hasattr(queue, 'name') else str(queue)
-    name = client.queue_path(project, region, queue_name)
-    try:
-      q_resp = client.get_queue(request={'name': name, 'read_mask': read_mask})
-      ct_stats = getattr(q_resp, 'stats', None)
-
-      tasks = getattr(ct_stats, 'tasks_count', 0) if ct_stats else 0
-      oldest_eta_usec = None
-      if ct_stats and getattr(ct_stats, 'oldest_estimated_arrival_time', None):
-        oldest_eta = ct_stats.oldest_estimated_arrival_time
-        oldest_eta_usec = int(oldest_eta.timestamp() * 1e6)
-
-      executed_last_minute = getattr(ct_stats, 'executed_last_minute_count', 0) if ct_stats else 0
-      in_flight = getattr(ct_stats, 'concurrent_dispatches_count', 0) if ct_stats else 0
-      enforced_rate = getattr(ct_stats, 'effective_execution_rate', 0.0) if ct_stats else 0.0
-
-      qs = taskqueue.QueueStatistics(
-          queue=queue,
-          tasks=tasks,
-          oldest_eta_usec=oldest_eta_usec,
-          executed_last_minute=executed_last_minute,
-          in_flight=in_flight,
-          enforced_rate=enforced_rate,
-      )
-      queue_stats_list.append(qs)
-    except google_exceptions.NotFound as e:
-      raise taskqueue.UnknownQueueError(f'Queue {queue_name} not found: {e}')
-    except Exception as e:
-      raise e
-
-  if multiple:
-    return queue_stats_list
-  else:
-    return queue_stats_list[0] if queue_stats_list else None
