@@ -217,22 +217,30 @@ def sweep_wsgi_app(environ, start_response):
 
 
 @contextlib.contextmanager
-def _use_default_datastore_adapter():
-  conn = datastore._GetConnection()
-  orig_adapter = getattr(conn, '_BaseConnection__adapter', None)
-  if orig_adapter is not None:
-    conn._BaseConnection__adapter = datastore._adapter
-    try:
+def _use_default_datastore_adapter(non_transactional=False):
+  popped_conn = None
+  if non_transactional and datastore.IsInTransaction():
+    popped_conn = datastore._PopConnection()
+
+  try:
+    conn = datastore._GetConnection()
+    orig_adapter = getattr(conn, '_BaseConnection__adapter', None)
+    if orig_adapter is not None:
+      conn._BaseConnection__adapter = datastore._adapter
+      try:
+        yield
+      finally:
+        conn._BaseConnection__adapter = orig_adapter
+    else:
       yield
-    finally:
-      conn._BaseConnection__adapter = orig_adapter
-  else:
-    yield
+  finally:
+    if popped_conn is not None:
+      datastore._PushConnection(popped_conn)
 
 
 def _dispatch_pending_keys_now(pending_keys, handled_by_sweeper=False):
   try:
-    with _use_default_datastore_adapter():
+    with _use_default_datastore_adapter(non_transactional=True):
       entities = datastore.Get(pending_keys)
   except Exception as e:
     logging.error("Failed to fetch pending transactional tasks: %s", e)
@@ -254,7 +262,7 @@ def _dispatch_pending_keys_now(pending_keys, handled_by_sweeper=False):
       entity['status'] = _TX_TASK_STATUS_PROCESSING
       entity['lock_expires'] = now + datetime.timedelta(seconds=_SWEEPER_LOCK_TIMEOUT_SECONDS)
       entity['handled_by_sweeper'] = handled_by_sweeper
-      with _use_default_datastore_adapter():
+      with _use_default_datastore_adapter(non_transactional=True):
         datastore.Put(entity)
     except Exception as e:
       logging.warning("Failed to acquire lock for task %s: %s", task_name, e)
@@ -263,11 +271,11 @@ def _dispatch_pending_keys_now(pending_keys, handled_by_sweeper=False):
     try:
       payload = json.loads(payload_str)
       dispatch_task_payload(queue_name, payload)
-      with _use_default_datastore_adapter():
+      with _use_default_datastore_adapter(non_transactional=True):
         datastore.Delete(entity.key())
       logging.info("Successfully dispatched transactional task %s", task_name)
     except (google_exceptions.AlreadyExists, google_exceptions.Conflict):
-      with _use_default_datastore_adapter():
+      with _use_default_datastore_adapter(non_transactional=True):
         datastore.Delete(entity.key())
       logging.info("Transactional task %s already exists in Cloud Tasks; cleaned up entity", task_name)
     except Exception as e:
@@ -284,7 +292,7 @@ def _dispatch_pending_keys_now(pending_keys, handled_by_sweeper=False):
         entity['status'] = _TX_TASK_STATUS_PENDING
         entity['lock_expires'] = None
       try:
-        with _use_default_datastore_adapter():
+        with _use_default_datastore_adapter(non_transactional=True):
           datastore.Put(entity)
       except Exception as put_err:
         logging.error("Failed to record error state for task %s: %s", task_name, put_err)

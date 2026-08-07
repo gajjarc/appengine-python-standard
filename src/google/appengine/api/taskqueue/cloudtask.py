@@ -468,6 +468,14 @@ def _create_batch_tasks_in_cloud_tasks(queue_name, tasks, multiple):
 
       if exception is not None:
         raise exception
+    except (google_exceptions.AlreadyExists, google_exceptions.Conflict) as e:
+      raise taskqueue.TaskAlreadyExistsError(str(e))
+    except google_exceptions.NotFound as e:
+      raise taskqueue.UnknownQueueError(str(e))
+    except google_exceptions.BadRequest as e:
+      if 'Queue does not exist' in str(e):
+        raise taskqueue.UnknownQueueError(str(e))
+      raise e
     except Exception as e:
       raise e
 
